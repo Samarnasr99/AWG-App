@@ -4,6 +4,7 @@
 # - Wind speed input remains for ML/KNN
 # - Default models & dataset auto-downloaded from GitHub Releases
 # - Robust header aliasing for KNN inputs
+# - Horizontal bar charts with optional ±% error bars (ML vs KNN)
 
 import io
 import math
@@ -15,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
 
 # Optional imports
 try:
@@ -55,6 +57,9 @@ TARGETS = [
     'ph',
     'Conductivity (µS/cm)',
     'Turbidity (NTU)',
+    'SEC (kWh/L)',
+    'COP',
+    'Efficiency (%)'
 ]
 
 RAW_TARGET_TO_STD = {
@@ -208,9 +213,7 @@ def _normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
             continue
         found_col = None
 
-        # Alias matches (in several normalization styles)
         for alias in aliases:
-            # exact normalized key
             if alias in norm_map:
                 found_col = norm_map[alias]; break
             alias_norm = alias.lower().strip()
@@ -222,7 +225,6 @@ def _normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
             if alias_key in norm_map:
                 found_col = norm_map[alias_key]; break
 
-        # Heuristics
         if not found_col:
             wanted = norm(target)
             for c in df.columns:
@@ -391,6 +393,62 @@ def _load_model_artifacts(uploaded_files: List):
         models[raw_key] = obj
     return models, scaler
 
+# ---------------------- Plot helpers ----------------------
+
+_ORDER_FOR_PLOT = [
+    'Water production (L/h)', 'Power (kW)', 'DO (mg/L)', 'ph',
+    'Conductivity (µS/cm)', 'Turbidity (NTU)', 'SEC (kWh/L)', 'COP', 'Efficiency (%)'
+]
+
+def _build_plot_payload(row: dict) -> Dict[str, float]:
+    return {k: row.get(k) for k in _ORDER_FOR_PLOT if k in row}
+
+def _bar_chart_with_optional_error(values_ml: Dict[str, float],
+                                   values_knn: Optional[Dict[str, float]] = None):
+    """Draw horizontal bars for ML values; if KNN provided, add ±% error bars
+    where pct = |ML - KNN| / ML * 100, and annotate 'value ±pct%'."""
+    labels, nums, xerr, ann = [], [], None, []
+    for k in _ORDER_FOR_PLOT:
+        if k in values_ml and values_ml[k] is not None:
+            try:
+                v = float(values_ml[k])
+            except Exception:
+                continue
+            labels.append(k); nums.append(v)
+            if values_knn and k in values_knn and values_knn[k] is not None:
+                try:
+                    kn = float(values_knn[k])
+                    pct = 0.0 if v == 0 else abs(v - kn) / abs(v) * 100.0
+                    err_abs = abs(v) * (pct / 100.0)
+                except Exception:
+                    pct, err_abs = 0.0, 0.0
+            else:
+                pct, err_abs = 0.0, 0.0
+            ann.append(pct)
+            # collect xerr per-bar
+            if xerr is None: xerr = []
+            xerr.append(err_abs)
+
+    if not nums:
+        return None
+
+    fig, ax = plt.subplots(figsize=(7.6, 4.8))
+    y = np.arange(len(labels))[::-1]
+    if xerr is not None:
+        ax.barh(y, nums, xerr=xerr, capsize=4, edgecolor="black")
+    else:
+        ax.barh(y, nums, edgecolor="black")
+    ax.set_yticks(y, labels)
+    ax.grid(axis="x", linestyle="--", alpha=0.25)
+
+    # annotate "value  ±p%"
+    for yi, v, p in zip(y, nums, ann):
+        tail = f"  {v:.2f}" + (f"  ±{p:.1f}%" if p > 0 else "")
+        ax.text(v, yi, tail, va="center", ha="left", fontsize=9)
+
+    plt.tight_layout()
+    return fig
+
 # ---------------------- Sidebar ----------------------
 
 st.sidebar.header("Configuration")
@@ -448,9 +506,14 @@ with tab1:
     if do_calc:
         rows = []
         feats, feat_names = _build_feature_vector(temp, rh, speed)
+        ml_row = None
+        knn_row = None
+
         if models_dict:
             ml_out = _predict_direct(models_dict, scaler_obj, feats, feat_names)
-            rows.append(_pack_predictions_row(temp, rh, speed, ml_out) | {'Model': 'ML-direct'})
+            ml_row = _pack_predictions_row(temp, rh, speed, ml_out) | {'Model': 'ML-direct'}
+            rows.append(ml_row)
+
         if hist_df is not None:
             try:
                 outs, stds, nsel = _knn_match(hist_df, temp, rh, speed, tol_temp, tol_rh, tol_speed, k_max)
@@ -472,6 +535,13 @@ with tab1:
             st.dataframe(df_show, use_container_width=True)
             st.session_state['last_single_df'] = df_show
 
+            # ---- Plot: ML with ±% error vs KNN if available
+            vals_ml = _build_plot_payload(ml_row or rows[0])
+            vals_knn = _build_plot_payload(knn_row) if knn_row else None
+            fig = _bar_chart_with_optional_error(vals_ml, vals_knn)
+            if fig is not None:
+                st.pyplot(fig, use_container_width=True)
+
 # --- Compare
 with tab2:
     st.subheader("Side-by-side comparison")
@@ -483,13 +553,17 @@ with tab2:
 
     if do_cmp:
         rows = []
+        ml_row = None
         if models_dict:
             feats, feat_names = _build_feature_vector(temp_c, rh_c, spd_c)
             ml_out = _predict_direct(models_dict, scaler_obj, feats, feat_names)
-            rows.append(_pack_predictions_row(temp_c, rh_c, spd_c, ml_out) | {'Model': 'ML-direct'})
+            ml_row = _pack_predictions_row(temp_c, rh_c, spd_c, ml_out) | {'Model': 'ML-direct'}
+            rows.append(ml_row)
+        knn_row = None
         if hist_df is not None:
             outs, stds, nsel = _knn_match(hist_df, temp_c, rh_c, spd_c, tol_temp, tol_rh, tol_speed, k_max)
-            rows.append(_pack_predictions_row(temp_c, rh_c, spd_c, outs) | {'Model': f'KNN (n={nsel})'})
+            knn_row = _pack_predictions_row(temp_c, rh_c, spd_c, outs) | {'Model': f'KNN (n={nsel})'}
+            rows.append(knn_row)
 
         if rows:
             df = pd.DataFrame(rows)
@@ -503,6 +577,13 @@ with tab2:
                 st.caption("ML-direct minus KNN (positive means ML higher):")
                 st.dataframe(pd.DataFrame([deltas]), use_container_width=True)
             st.session_state['last_compare_df'] = df
+
+            # ---- Plot: ML with ±% error vs KNN
+            vals_ml = _build_plot_payload(ml_row or rows[0])
+            vals_knn = _build_plot_payload(knn_row) if knn_row else None
+            fig = _bar_chart_with_optional_error(vals_ml, vals_knn)
+            if fig is not None:
+                st.pyplot(fig, use_container_width=True)
         else:
             st.warning("Provide both a dataset and model artifacts to compare.")
 
