@@ -2,8 +2,8 @@
 # - Airflow for KPIs is fixed internally at 90,000 m³/h (no UI text)
 # - Default models & dataset auto-downloaded from GitHub Releases
 # - Column normalization for KNN inputs
-# - Horizontal bar charts with ±% error bars (ML vs KNN), no "Airborne water" in plot
-# - DataFrame display falls back to pure HTML if Arrow fails
+# - Horizontal bar charts with ±% error bars (ML vs ref), Airborne water NOT plotted
+# - Single-point tables include SEC, COP, Capture efficiency, Airborne water
 # - Explain/AD tab: only AD bounds/flags (SHAP removed)
 
 import io, math, os
@@ -16,7 +16,6 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# XGBoost fallback (for sklearn wrapper quirks)
 try:
     import xgboost as xgb
 except Exception:
@@ -39,7 +38,6 @@ EXPECTED_INPUTS = [
     'Wind_in_speed (m/s)',
 ]
 
-# Direct (measured/predicted) targets only
 TARGETS = [
     'Water production (L/h)',
     'Power (kW)',
@@ -49,7 +47,6 @@ TARGETS = [
     'Turbidity (NTU)',
 ]
 
-# Derived metrics appended to rows (computed from inputs and targets)
 DERIVED_METRICS = ['SEC (kWh/L)', 'COP', 'Airborne water (kg/h)', 'Capture efficiency (%)']
 
 RAW_TARGET_TO_STD = {
@@ -210,7 +207,12 @@ def _pack_predictions_row(temp, rh, speed, outputs_dict):
         'Wind_in_speed (m/s)': speed,
     }
     row.update(outputs_dict)
-    row.update({'SEC (kWh/L)': sec, 'COP': cop, 'Airborne water (kg/h)': airborne, 'Capture efficiency (%)': eff})
+    row.update({
+        'SEC (kWh/L)': sec,
+        'COP': cop,
+        'Airborne water (kg/h)': airborne,
+        'Capture efficiency (%)': eff
+    })
     return row
 
 def _predict_direct(models: Dict[str, BaseEstimator], scaler: Optional[StandardScaler],
@@ -299,7 +301,6 @@ def _load_model_artifacts(uploaded_files: List):
     return models, scaler
 
 # =============================== Plot helpers ================================
-# Order used in plot (NO 'Airborne water (kg/h)' here):
 _ORDER_FOR_PLOT = [
     'Water production (L/h)', 'Power (kW)', 'DO (mg/L)', 'ph',
     'Conductivity (µS/cm)', 'Turbidity (NTU)', 'SEC (kWh/L)', 'COP',
@@ -309,17 +310,17 @@ _ORDER_FOR_PLOT = [
 def _build_plot_payload(row: dict) -> Dict[str, float]:
     return {k: row.get(k) for k in _ORDER_FOR_PLOT if k in row}
 
-def _bar_chart_with_optional_error(values_ml: Dict[str, float], values_knn: Optional[Dict[str, float]] = None):
+def _bar_chart_with_optional_error(values_ml: Dict[str, float], values_ref: Optional[Dict[str, float]] = None):
     labels, nums, xerr_abs, pct_ann = [], [], [], []
     for k in _ORDER_FOR_PLOT:
         if k in values_ml and values_ml[k] is not None:
             try: v = float(values_ml[k])
             except Exception: continue
             labels.append(k); nums.append(v)
-            if values_knn and k in values_knn and values_knn[k] is not None:
+            if values_ref and k in values_ref and values_ref[k] is not None:
                 try:
-                    kn = float(values_knn[k])
-                    pct = 0.0 if v == 0 else abs(v - kn)/max(1e-9, abs(v))*100.0
+                    ref = float(values_ref[k])
+                    pct = 0.0 if v == 0 else abs(v - ref)/max(1e-9, abs(v))*100.0
                     err_abs = abs(v)*(pct/100.0)
                 except Exception:
                     pct, err_abs = 0.0, 0.0
@@ -331,20 +332,17 @@ def _bar_chart_with_optional_error(values_ml: Dict[str, float], values_knn: Opti
 
     max_bar = max(nums)
     max_err = max(xerr_abs) if xerr_abs else 0.0
-    pad = max(0.03 * (max_bar + max_err), 0.5)  # right-side padding for labels
+    pad = max(0.03 * (max_bar + max_err), 0.5)
 
     fig, ax = plt.subplots(figsize=(7.6, 4.8))
     y = np.arange(len(labels))[::-1]
-
     if any(e > 0 for e in xerr_abs):
         ax.barh(y, nums, xerr=xerr_abs, capsize=4, edgecolor="black")
     else:
         ax.barh(y, nums, edgecolor="black")
-
     ax.set_yticks(y, labels)
     ax.grid(axis="x", linestyle="--", alpha=0.25)
 
-    # Text placed to the RIGHT of bar + error bar
     for yi, v, p, e in zip(y, nums, pct_ann, xerr_abs):
         x_text = v + e + pad
         txt = f"{v:.2f}" + (f"  ±{p:.1f}%" if p > 0 else "")
@@ -380,12 +378,6 @@ def _sanitize_for_arrow(df: pd.DataFrame) -> pd.DataFrame:
     return df2.reset_index(drop=True)
 
 def _display_df(df: pd.DataFrame, *, use_container_width=True):
-    """
-    Robust display:
-      1) Try Streamlit's Arrow-backed dataframe (fast, interactive).
-      2) If Arrow raises (ValueError, etc.), render a pure-HTML table instead.
-      3) If HTML rendering somehow fails, print CSV text.
-    """
     clean = _sanitize_for_arrow(df)
     try:
         st.dataframe(clean, use_container_width=use_container_width)
@@ -438,7 +430,6 @@ with st.sidebar.expander("Upload historical dataset for KNN (.csv/.xlsx)", expan
         except Exception as e:
             st.error(f"Failed to read dataset: {e}")
 
-# Auto-load default dataset if none uploaded
 if hist_df is None and DEFAULT_DATA_URL:
     try:
         hist_df = _download_table(DEFAULT_DATA_URL)
@@ -453,12 +444,10 @@ with st.sidebar.expander("KNN settings", expanded=False):
     tol_speed = st.number_input("Speed window (±m/s)", 0.05, 5.0, 0.5, 0.05)
     k_max = st.slider("Max neighbors (fallback)", 1, 15, 5, 1)
 
-# Auto-fill models from Release if nothing uploaded
 models_dict, scaler_obj = _autofill_models_if_none(models_dict, scaler_obj)
 
-st.title("AWG Dual Calculator: KNN matcher + ML direct predictor")
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Single-point", "Compare (KNN vs ML)", "Batch", "Explain/AD", "Downloads"])
+# ----------------- Tabs (renamed second one to “Compare”) --------------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Single-point", "Compare", "Batch", "Explain/AD", "Downloads"])
 
 # ============================= Single-point ==================================
 with tab1:
@@ -492,6 +481,7 @@ with tab1:
         if not rows:
             st.warning("Please upload either model artifacts (for ML-direct) or ensure the default models/dataset loaded.")
         else:
+            # Ensure SEC, COP, Capture efficiency, Airborne water are in the table
             order_cols = ['Model'] + EXPECTED_INPUTS + TARGETS + DERIVED_METRICS
             df = pd.DataFrame(rows)
             extra = [c for c in df.columns if c.endswith('STD%')]
@@ -501,8 +491,8 @@ with tab1:
             st.session_state['last_single_df'] = df_show
 
             vals_ml  = _build_plot_payload(ml_row or rows[0])
-            vals_knn = _build_plot_payload(knn_row) if knn_row else None
-            fig = _bar_chart_with_optional_error(vals_ml, vals_knn)
+            vals_ref = _build_plot_payload(knn_row) if knn_row else None
+            fig = _bar_chart_with_optional_error(vals_ml, vals_ref)
             if fig is not None: st.pyplot(fig, use_container_width=True)
 
 # =============================== Compare =====================================
@@ -533,13 +523,12 @@ with tab2:
             feats, feat_names = _build_feature_vector(temp, rh, spd)
             outs = _predict_direct(models_dict, scaler_obj, feats, feat_names)
             return _pack_predictions_row(temp, rh, spd, outs) | {'Model': 'ML-direct'}
-        else:  # KNN
+        else:
             if hist_df is None:
                 st.warning("KNN dataset not available. Upload or let the app auto-download it.")
                 return None
             outs, stds, nsel = _knn_match(hist_df, temp, rh, spd, tol_temp, tol_rh, tol_speed, k_max)
             row = _pack_predictions_row(temp, rh, spd, outs) | {'Model': f'KNN (n={nsel})'}
-            # attach relative scatter as STD% columns (optional)
             for k, v in stds.items():
                 if k in outs and outs[k] != 0:
                     row[f"{k} STD%"] = 100.0 * v / abs(outs[k])
@@ -555,14 +544,12 @@ with tab2:
             df_show = df.reindex(columns=[c for c in order_cols if c in df.columns])
             _display_df(df_show)
 
-            # Delta: B - A
             deltas = {k: (rowB.get(k, np.nan) if rowB.get(k) is not None else np.nan) -
                           (rowA.get(k, np.nan) if rowA.get(k) is not None else np.nan)
                       for k in TARGETS + DERIVED_METRICS}
             st.caption("Δ (Scenario B − Scenario A)")
             _display_df(pd.DataFrame([deltas]))
 
-            # Bar plot: Scenario A as bars, Scenario B as “±%” (shown as error)
             vals_A = _build_plot_payload(rowA)
             vals_B = _build_plot_payload(rowB)
             fig = _bar_chart_with_optional_error(vals_A, vals_B)
