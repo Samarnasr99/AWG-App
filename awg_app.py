@@ -1,4 +1,11 @@
-# awg_app.py — AWG predictions (ML-direct + KNN) with robust DataFrame display
+# awg_app.py — AWG predictions (ML-direct + KNN) with robust table display + plots
+# - Airflow for KPIs is fixed internally at 90,000 m³/h
+# - Default models & dataset auto-downloaded from GitHub Releases
+# - Column normalization for KNN inputs
+# - Horizontal bar charts with ±% error bars (ML vs KNN)
+# - SHAP bar plot via matplotlib (no Arrow)
+# - DataFrame display falls back to pure HTML if Arrow fails
+
 import io, math, os
 from io import BytesIO
 from pathlib import Path
@@ -15,6 +22,7 @@ try:
 except Exception:
     shap = None
 
+# XGBoost fallback (for sklearn wrapper quirks)
 try:
     import xgboost as xgb
 except Exception:
@@ -37,6 +45,7 @@ EXPECTED_INPUTS = [
     'Wind_in_speed (m/s)',
 ]
 
+# Direct (measured/predicted) targets only
 TARGETS = [
     'Water production (L/h)',
     'Power (kW)',
@@ -44,10 +53,10 @@ TARGETS = [
     'ph',
     'Conductivity (µS/cm)',
     'Turbidity (NTU)',
-    'SEC (kWh/L)',
-    'COP',
-    'Efficiency (%)'
 ]
+
+# Derived metrics appended to rows (computed from inputs and targets)
+DERIVED_METRICS = ['SEC (kWh/L)', 'COP', 'Airborne water (kg/h)', 'Capture efficiency (%)']
 
 RAW_TARGET_TO_STD = {
     'Water production (L)': 'Water production (L/h)',
@@ -59,18 +68,28 @@ RAW_TARGET_TO_STD = {
 }
 STD_TO_RAW_TARGET = {v: k for k, v in RAW_TARGET_TO_STD.items()}
 
-DERIVED_METRICS = ['SEC (kWh/L)', 'COP', 'Airborne water (kg/h)', 'Capture efficiency (%)']
-
+# ---- GitHub Release assets ----
 DEFAULT_MODEL_URLS = {
-    "scaler_final_model_set": os.environ.get("SCALER_URL", st.secrets.get("SCALER_URL", "https://github.com/Samarnasr99/AWG-App/releases/download/Models/scaler_final_model_set.pkl")),
-    "Water production (L)":   os.environ.get("WATER_URL",  st.secrets.get("WATER_URL",  "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Water.production.L._final_model.pkl")),
-    "real_time_power (kW)":   os.environ.get("POWER_URL",  st.secrets.get("POWER_URL",  "https://github.com/Samarnasr99/AWG-App/releases/download/Models/real_time_power.kW._final_model.pkl")),
-    "DO":                     os.environ.get("DO_URL",     st.secrets.get("DO_URL",     "https://github.com/Samarnasr99/AWG-App/releases/download/Models/DO_final_model.pkl")),
-    "ph":                     os.environ.get("PH_URL",     st.secrets.get("PH_URL",     "https://github.com/Samarnasr99/AWG-App/releases/download/Models/ph_final_model.pkl")),
-    "Conductivity":           os.environ.get("COND_URL",   st.secrets.get("COND_URL",   "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Conductivity_final_model.pkl")),
-    "water_turb":             os.environ.get("TURB_URL",   st.secrets.get("TURB_URL",   "https://github.com/Samarnasr99/AWG-App/releases/download/Models/water_turb_final_model.pkl")),
+    "scaler_final_model_set": os.environ.get("SCALER_URL", st.secrets.get("SCALER_URL",
+        "https://github.com/Samarnasr99/AWG-App/releases/download/Models/scaler_final_model_set.pkl")),
+    "Water production (L)":   os.environ.get("WATER_URL", st.secrets.get("WATER_URL",
+        "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Water.production.L._final_model.pkl")),
+    "real_time_power (kW)":   os.environ.get("POWER_URL", st.secrets.get("POWER_URL",
+        "https://github.com/Samarnasr99/AWG-App/releases/download/Models/real_time_power.kW._final_model.pkl")),
+    "DO":                     os.environ.get("DO_URL", st.secrets.get("DO_URL",
+        "https://github.com/Samarnasr99/AWG-App/releases/download/Models/DO_final_model.pkl")),
+    "ph":                     os.environ.get("PH_URL", st.secrets.get("PH_URL",
+        "https://github.com/Samarnasr99/AWG-App/releases/download/Models/ph_final_model.pkl")),
+    "Conductivity":           os.environ.get("COND_URL", st.secrets.get("COND_URL",
+        "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Conductivity_final_model.pkl")),
+    "water_turb":             os.environ.get("TURB_URL", st.secrets.get("TURB_URL",
+        "https://github.com/Samarnasr99/AWG-App/releases/download/Models/water_turb_final_model.pkl")),
 }
-DEFAULT_DATA_URL = os.environ.get("DATA_URL", st.secrets.get("DATA_URL", "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Search_and_fit._AWG.xlsx"))
+
+DEFAULT_DATA_URL = os.environ.get(
+    "DATA_URL",
+    st.secrets.get("DATA_URL", "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Search_and_fit._AWG.xlsx")
+)
 
 # =============================== Caching =====================================
 try:
@@ -113,13 +132,16 @@ def _autofill_models_if_none(models_dict: Dict[str, BaseEstimator], scaler_obj: 
 
 # =============================== Utilities ===================================
 def calc_metrics(temp_c: float, rh_pct: float, speed_ms: float, water_lph: float, power_kw: float):
+    """Derived KPIs with airflow fixed at 90,000 m³/h."""
     h_fg_kj_per_kg = 2260.0
     p_sat_kpa = 0.6108 * math.exp((17.27 * temp_c) / (temp_c + 237.3))
     p_vapor_kpa = (rh_pct / 100.0) * p_sat_kpa
     abs_humidity_g_per_m3 = (216.7 * p_vapor_kpa) / (temp_c + 273.15)
     abs_humidity_kg_per_m3 = abs_humidity_g_per_m3 / 1000.0
-    air_volume_m3ph = _AIRFLOW_M3PH
+
+    air_volume_m3ph = _AIRFLOW_M3PH  # fixed
     total_water_air_kgph = air_volume_m3ph * abs_humidity_kg_per_m3
+
     sec = (power_kw) / (water_lph) if water_lph > 0 else float("inf")
     cop = (water_lph * h_fg_kj_per_kg) / (power_kw * 3600.0) if power_kw > 0 else 0.0
     efficiency = (water_lph / (total_water_air_kgph * 1.0)) * 100.0 if total_water_air_kgph > 0 else 0.0
@@ -141,9 +163,18 @@ def _read_dataframe(uploaded_file) -> pd.DataFrame:
 
 # ---- Column aliasing (avoid KeyError) ----
 COL_ALIASES = {
-    'Wind_in_temperature (°C)': {'wind_in_temperature (°c)','wind_in_temperature','wind_in_temp','windintemperature','temperature (°c)','temperature','temp','t','temp_c'},
-    'Wind_in_rh (%)': {'wind_in_rh (%)','wind_in_rh','windinrh','wind_rh','rh (%)','relative humidity (%)','relative humidity','rh','humidity'},
-    'Wind_in_speed (m/s)': {'wind_in_speed (m/s)','wind_in_speed','windspeed','wind_speed','wind speed (m/s)','wind speed','speed (m/s)','speed','v','u'},
+    'Wind_in_temperature (°C)': {
+        'wind_in_temperature (°c)','wind_in_temperature','wind_in_temp','windintemperature',
+        'temperature (°c)','temperature','temp','t','temp_c'
+    },
+    'Wind_in_rh (%)': {
+        'wind_in_rh (%)','wind_in_rh','windinrh','wind_rh',
+        'rh (%)','relative humidity (%)','relative humidity','rh','humidity'
+    },
+    'Wind_in_speed (m/s)': {
+        'wind_in_speed (m/s)','wind_in_speed','windspeed','wind_speed',
+        'wind speed (m/s)','wind speed','speed (m/s)','speed','v','u'
+    },
 }
 
 def _normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -230,6 +261,7 @@ def _knn_match(df: pd.DataFrame, temp: float, rh: float, speed: float,
         sel = df.iloc[ind[0].tolist()]
     else:
         sel = dff
+
     outs, stds = {}, {}
     for std_name in TARGETS:
         raw_col = next((k for k, v in RAW_TARGET_TO_STD.items() if v == std_name), None)
@@ -274,8 +306,11 @@ def _load_model_artifacts(uploaded_files: List):
 
 # =============================== Plot helpers ================================
 _ORDER_FOR_PLOT = [
+    # measured/predicted first
     'Water production (L/h)', 'Power (kW)', 'DO (mg/L)', 'ph',
-    'Conductivity (µS/cm)', 'Turbidity (NTU)', 'SEC (kWh/L)', 'COP', 'Efficiency (%)'
+    'Conductivity (µS/cm)', 'Turbidity (NTU)',
+    # derived after
+    'SEC (kWh/L)', 'COP', 'Airborne water (kg/h)', 'Capture efficiency (%)'
 ]
 
 def _build_plot_payload(row: dict) -> Dict[str, float]:
@@ -290,7 +325,9 @@ def _bar_chart_with_optional_error(values_ml: Dict[str, float], values_knn: Opti
             labels.append(k); nums.append(v)
             if values_knn and k in values_knn and values_knn[k] is not None:
                 try:
-                    kn = float(values_knn[k]); pct = 0.0 if v == 0 else abs(v - kn)/abs(v)*100.0; err_abs = abs(v)*(pct/100.0)
+                    kn = float(values_knn[k])
+                    pct = 0.0 if v == 0 else abs(v - kn)/abs(v)*100.0
+                    err_abs = abs(v)*(pct/100.0)
                 except Exception:
                     pct, err_abs = 0.0, 0.0
             else:
@@ -332,13 +369,45 @@ def _sanitize_for_arrow(df: pd.DataFrame) -> pd.DataFrame:
     return df2.reset_index(drop=True)
 
 def _display_df(df: pd.DataFrame, *, use_container_width=True):
-    """Robust display: sanitize -> try dataframe; on failure, stringify columns."""
+    """
+    Robust display:
+      1) Try Streamlit's Arrow-backed dataframe (fast, interactive).
+      2) If Arrow raises (ValueError, etc.), render a pure-HTML table instead.
+      3) If HTML rendering somehow fails, print CSV text.
+    """
     clean = _sanitize_for_arrow(df)
+    # First try normal interactive dataframe
     try:
         st.dataframe(clean, use_container_width=use_container_width)
+        return
     except Exception:
-        # final fallback: stringify everything to guarantee Arrow compatibility
-        st.dataframe(clean.astype(str), use_container_width=use_container_width)
+        pass  # fall through to HTML
+
+    # FINAL FALLBACK: pure HTML (no Arrow involved)
+    try:
+        printable = clean.copy()
+        for c in printable.columns:
+            printable[c] = printable[c].map(lambda x: "" if x is None else str(x))
+        html = printable.to_html(index=False, escape=True, border=0, justify="center")
+        st.markdown(
+            """
+            <style>
+              .dfwrap {overflow:auto; max-height: 520px; border: 1px solid #444; border-radius: 6px; padding: 8px;}
+              .dfwrap table {border-collapse: collapse; width: 100%;}
+              .dfwrap th, .dfwrap td {border: 1px solid #555; padding: 6px 8px; text-align: center; font-size: 0.9rem;}
+              .dfwrap thead th {position: sticky; top: 0; background: #111;}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(f"<div class='dfwrap'>{html}</div>", unsafe_allow_html=True)
+    except Exception as e:
+        # Absolute last resort: show CSV text
+        try:
+            buf = io.StringIO(); clean.to_csv(buf, index=False)
+            st.text(buf.getvalue())
+        except Exception:
+            st.error(f"Could not display table: {e}")
 
 # ================================ Sidebar ====================================
 st.sidebar.header("Configuration")
@@ -362,6 +431,7 @@ with st.sidebar.expander("Upload historical dataset for KNN (.csv/.xlsx)", expan
         except Exception as e:
             st.error(f"Failed to read dataset: {e}")
 
+# Auto-load default dataset if none uploaded
 if hist_df is None and DEFAULT_DATA_URL:
     try:
         hist_df = _download_table(DEFAULT_DATA_URL)
@@ -376,9 +446,11 @@ with st.sidebar.expander("KNN settings", expanded=False):
     tol_speed = st.number_input("Speed window (±m/s)", 0.05, 5.0, 0.5, 0.05)
     k_max = st.slider("Max neighbors (fallback)", 1, 15, 5, 1)
 
+# Auto-fill models from Release if nothing uploaded
 models_dict, scaler_obj = _autofill_models_if_none(models_dict, scaler_obj)
 
 st.title("AWG Dual Calculator: KNN matcher + ML direct predictor")
+st.caption("Note: KPIs assume fixed airflow of 90,000 m³/h. Wind speed still affects KNN filtering and ML features.")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Single-point", "Compare (KNN vs ML)", "Batch", "Explain/AD", "Downloads"])
 
@@ -531,8 +603,11 @@ with tab4:
                     bounds[name] = (lo, hi)
             ad_df = pd.DataFrame(bounds, index=['p01','p99']).T
             _display_df(ad_df)
-            flags = {nm: (val := {'Wind_in_temperature (°C)': t_e, 'Wind_in_rh (%)': rh_e, 'Wind_in_speed (m/s)': sp_e}[nm]) < bounds[nm][0] or val > bounds[nm][1]
-                     for nm in bounds}
+            flags = {
+                nm: (val := {'Wind_in_temperature (°C)': t_e, 'Wind_in_rh (%)': rh_e, 'Wind_in_speed (m/s)': sp_e}[nm]) < bounds[nm][0]
+                    or val > bounds[nm][1]
+                for nm in bounds
+            }
             st.info(f"Out-of-domain flags (1%/99% bounds): {flags}")
         else:
             st.warning("Upload training features to enable AD bounds.")
@@ -558,9 +633,16 @@ with tab4:
                     vals = sv.values[0] if hasattr(sv, "values") else sv[0].values
                     shap_df = pd.DataFrame({'feature': feat_names, 'shap_value': vals})
                     _display_df(shap_df)
+
+                    # Matplotlib SHAP bar (avoid Arrow)
+                    fig, ax = plt.subplots(figsize=(6.4, 3.6))
+                    ax.barh(range(len(feat_names)), shap_df['shap_value'].astype(float))
+                    ax.set_yticks(range(len(feat_names))); ax.set_yticklabels(shap_df['feature'])
+                    ax.grid(axis="x", linestyle="--", alpha=0.25)
+                    plt.tight_layout()
+                    st.pyplot(fig, use_container_width=True)
+
                     st.session_state['last_shap_df'] = shap_df
-                    st.caption("Bar chart of SHAP values")
-                    st.bar_chart(pd.DataFrame(shap_df).set_index('feature'))
             except Exception as e:
                 st.error(f"SHAP error: {e}")
 
