@@ -6,6 +6,7 @@
 # - Robust header aliasing for KNN inputs
 # - Horizontal bar charts with optional ±% error bars (ML vs KNN)
 # - Safe column selection to avoid KeyError in tables
+# - Clean DataFrames before display to avoid PyArrow ValueError
 
 import io
 import math
@@ -449,12 +450,22 @@ def _bar_chart_with_optional_error(values_ml: Dict[str, float],
     plt.tight_layout()
     return fig
 
-# ---------------------- Table helper (fix KeyError) ----------------------
+# ---------------------- Table helpers ----------------------
 
 def _safe_reindex(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     """Return df with only columns that actually exist, preserving order."""
     keep = [c for c in cols if c in df.columns]
     return df.reindex(columns=keep)
+
+def _clean_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert numerics to plain floats and replace NaN/inf with None for Arrow."""
+    def conv(x):
+        if isinstance(x, (int, float, np.integer, np.floating)):
+            if pd.isna(x) or (isinstance(x, float) and (math.isinf(x) or math.isnan(x))):
+                return None
+            return float(x)
+        return x
+    return df.applymap(conv)
 
 # ---------------------- Sidebar ----------------------
 
@@ -541,6 +552,7 @@ with tab1:
             extra = [c for c in df.columns if c.endswith('STD%')]
             df_show = _safe_reindex(df, order_cols + extra)
             df_show = df_show.applymap(lambda z: nice_float(z, 3) if isinstance(z, (float, np.floating)) else z)
+            df_show = _clean_for_display(df_show)
             st.dataframe(df_show, use_container_width=True)
             st.session_state['last_single_df'] = df_show
 
@@ -578,6 +590,7 @@ with tab2:
             df = pd.DataFrame(rows)
             order_cols = ['Model'] + TARGETS + DERIVED_METRICS
             df_show = _safe_reindex(df, order_cols)
+            df_show = _clean_for_display(df_show)
             st.dataframe(df_show, use_container_width=True)
 
             if len(rows) == 2:
@@ -586,8 +599,10 @@ with tab2:
                        - (rows[1].get(k, np.nan) if rows[1].get(k) is not None else np.nan)
                     for k in TARGETS + DERIVED_METRICS
                 }
+                deltas_df = pd.DataFrame([deltas])
+                deltas_df = _clean_for_display(deltas_df)
                 st.caption("ML-direct minus KNN (positive means ML higher):")
-                st.dataframe(pd.DataFrame([deltas]), use_container_width=True)
+                st.dataframe(deltas_df, use_container_width=True)
 
             st.session_state['last_compare_df'] = df_show
 
@@ -624,6 +639,7 @@ with tab3:
                     out_rows.append(_pack_predictions_row(t, h, s, outs) | {'Model': f'KNN (n={nsel})'})
             if out_rows:
                 df_out = pd.DataFrame(out_rows)
+                df_out = _clean_for_display(df_out)
                 st.dataframe(df_out, use_container_width=True)
                 st.session_state['last_batch_df'] = df_out
             else:
@@ -659,6 +675,7 @@ with tab4:
                     lo, hi = np.percentile(train_feats[name].dropna().to_numpy(), [1, 99])
                     bounds[name] = (lo, hi)
             ad_df = pd.DataFrame(bounds, index=['p01', 'p99']).T
+            ad_df = _clean_for_display(ad_df)
             st.dataframe(ad_df, use_container_width=True)
             flags = {nm: (val := {'Wind_in_temperature (°C)': t_e, 'Wind_in_rh (%)': rh_e, 'Wind_in_speed (m/s)': sp_e}[nm]) < bounds[nm][0] or val > bounds[nm][1]
                      for nm in bounds}
@@ -689,10 +706,11 @@ with tab4:
                     sv = explainer(X)
                     vals = sv.values[0] if hasattr(sv, "values") else sv[0].values
                     shap_df = pd.DataFrame({'feature': feat_names, 'shap_value': vals})
+                    shap_df = _clean_for_display(shap_df)
                     st.dataframe(shap_df, use_container_width=True)
                     st.session_state['last_shap_df'] = shap_df
                     st.caption("Bar chart of SHAP values")
-                    st.bar_chart(shap_df.set_index('feature'))
+                    st.bar_chart(pd.DataFrame(shap_df).set_index('feature'))
             except Exception as e:
                 st.error(f"SHAP error: {e}")
 
