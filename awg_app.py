@@ -1,7 +1,9 @@
+# awg_app.py — auto-download models from GitHub Release + robust local upload mapping
 
-# awg_app.py
 import io
 import math
+import os
+from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -20,14 +22,16 @@ from sklearn.neighbors import KDTree
 from sklearn.utils.validation import check_is_fitted
 from sklearn.base import BaseEstimator
 import joblib
+import requests
 
 st.set_page_config(page_title="AWG Dual Calculator (KNN + ML)", layout="wide")
 
-# ---------------------- Utilities ----------------------
+# ---------------------- Constants / Mappings ----------------------
 
 EXPECTED_INPUTS = ['Wind_in_temperature (°C)', 'Wind_in_rh (%)', 'Wind_in_speed (m/s)']
 TARGETS = ['Water production (L/h)', 'Power (kW)', 'DO (mg/L)', 'ph', 'Conductivity (µS/cm)', 'Turbidity (NTU)']
 
+# Map raw target names (keys) to standardized column names (values) for display
 RAW_TARGET_TO_STD = {
     'Water production (L)': 'Water production (L/h)',
     'real_time_power (kW)': 'Power (kW)',
@@ -36,14 +40,72 @@ RAW_TARGET_TO_STD = {
     'Conductivity': 'Conductivity (µS/cm)',
     'water_turb': 'Turbidity (NTU)',
 }
-
+# Reverse map: std -> raw
 STD_TO_RAW_TARGET = {v: k for k, v in RAW_TARGET_TO_STD.items()}
 
 DERIVED_METRICS = ['SEC (kWh/L)', 'COP', 'Airborne water (kg/h)', 'Capture efficiency (%)']
 
+# ---- YOUR GITHUB RELEASE ASSETS (exact URLs provided) ----
+# (We also read env/secrets to allow overriding without code changes.)
+DEFAULT_MODEL_URLS = {
+    "scaler_final_model_set": os.environ.get("SCALER_URL", st.secrets.get("SCALER_URL", "https://github.com/Samarnasr99/AWG-App/releases/download/Models/scaler_final_model_set.pkl")),
+    "Water production (L)":   os.environ.get("WATER_URL",  st.secrets.get("WATER_URL",  "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Water.production.L._final_model.pkl")),
+    "real_time_power (kW)":   os.environ.get("POWER_URL",  st.secrets.get("POWER_URL",  "https://github.com/Samarnasr99/AWG-App/releases/download/Models/real_time_power.kW._final_model.pkl")),
+    "DO":                     os.environ.get("DO_URL",     st.secrets.get("DO_URL",     "https://github.com/Samarnasr99/AWG-App/releases/download/Models/DO_final_model.pkl")),
+    "ph":                     os.environ.get("PH_URL",     st.secrets.get("PH_URL",     "https://github.com/Samarnasr99/AWG-App/releases/download/Models/ph_final_model.pkl")),
+    "Conductivity":           os.environ.get("COND_URL",   st.secrets.get("COND_URL",   "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Conductivity_final_model.pkl")),
+    "water_turb":             os.environ.get("TURB_URL",   st.secrets.get("TURB_URL",   "https://github.com/Samarnasr99/AWG-App/releases/download/Models/water_turb_final_model.pkl")),
+}
+
+# ---------------------- Caching download helpers ----------------------
+
+try:
+    # modern name
+    from streamlit.runtime.caching import cache_resource as st_cache_resource
+except Exception:
+    st_cache_resource = st.cache_resource
+
+@st_cache_resource(show_spinner=False)
+def _download_joblib(url: str):
+    r = requests.get(url, timeout=180)
+    r.raise_for_status()
+    return joblib.load(BytesIO(r.content))
+
+def _autofill_models_if_none(models_dict: Dict[str, BaseEstimator],
+                             scaler_obj: Optional[StandardScaler]):
+    """
+    If the user didn't upload artifacts, pull them from DEFAULT_MODEL_URLS.
+    Keys in models_dict MUST be the RAW names (e.g., 'Water production (L)').
+    """
+    have_any = (models_dict and len(models_dict) > 0) or (scaler_obj is not None)
+    if have_any:
+        return models_dict, scaler_obj
+
+    fetched_models: Dict[str, BaseEstimator] = {}
+    fetched_scaler: Optional[StandardScaler] = None
+
+    for key_raw, url in DEFAULT_MODEL_URLS.items():
+        if not url:
+            continue
+        try:
+            obj = _download_joblib(url)
+            # Heuristic check for scaler (StandardScaler has mean_ & scale_)
+            if key_raw.startswith("scaler") or (hasattr(obj, "mean_") and hasattr(obj, "scale_")):
+                fetched_scaler = obj
+            else:
+                # key_raw is already the desired RAW name
+                fetched_models[key_raw] = obj
+        except Exception as e:
+            st.warning(f"Could not fetch '{key_raw}' from release: {e}")
+
+    return (fetched_models if fetched_models else models_dict,
+            fetched_scaler if fetched_scaler is not None else scaler_obj)
+
+# ---------------------- Utilities ----------------------
+
 def calc_metrics(temp_c: float, rh_pct: float, speed_ms: float, area_m2: float, water_lph: float, power_kw: float):
-    # Simple psychrometrics-based references
-    h_fg_kj_per_kg = 2260.0  # approximate latent heat
+    # Simple psychrometrics approximations
+    h_fg_kj_per_kg = 2260.0  # latent heat of vaporization (~kJ/kg)
     p_sat_kpa = 0.6108 * math.exp((17.27 * temp_c) / (temp_c + 237.3))  # kPa
     p_vapor_kpa = (rh_pct / 100.0) * p_sat_kpa
     abs_humidity_g_per_m3 = (216.7 * p_vapor_kpa) / (temp_c + 273.15)
@@ -163,20 +225,66 @@ def _build_feature_vector(temp, rh, speed):
     names = ['temp', 'log_rh', 'log_speed', 'temp_x_rh', 'speed_sq', 'temp/rh', 'turb_roll']
     return feats, names
 
+def _normalize_stem_to_raw(stem: str) -> Optional[str]:
+    """
+    Convert file stem like 'Water production (L)_final_model' or 'Water.production.L._final_model'
+    into RAW keys (e.g., 'Water production (L)'). Returns None if no match.
+    """
+    s = stem.replace('.', ' ')
+    s = s.replace('__', '_')  # just in case
+    s = s.replace('_final_model', '').strip()
+    candidates = [
+        ('Water production (L)', ['Water production (L)']),
+        ('real_time_power (kW)', ['real time power (kW)', 'real_time_power (kW)', 'real time power kW']),
+        ('DO', ['DO']),
+        ('ph', ['ph', 'pH', 'PH']),
+        ('Conductivity', ['Conductivity']),
+        ('water_turb', ['water turb', 'water_turb', 'turbidity']),
+    ]
+    s_low = s.lower()
+    for raw_key, aliases in candidates:
+        for a in aliases:
+            if s_low == a.lower():
+                return raw_key
+    # extra heuristics
+    if 'water' in s_low and 'production' in s_low and '(l)' in s_low:
+        return 'Water production (L)'
+    if 'power' in s_low and 'kw' in s_low:
+        return 'real_time_power (kW)'
+    if s_low in {'do'}:
+        return 'DO'
+    if s_low in {'ph', 'p h'}:
+        return 'ph'
+    if 'conduct' in s_low:
+        return 'Conductivity'
+    if 'turb' in s_low:
+        return 'water_turb'
+    return None
+
 def _load_model_artifacts(uploaded_files: List):
-    models = {}
-    scaler = None
+    """
+    Accept uploaded .pkl files (scaler + regressors). Map *_final_model to RAW keys.
+    """
+    models: Dict[str, BaseEstimator] = {}
+    scaler: Optional[StandardScaler] = None
     if not uploaded_files:
         return models, scaler
     for f in uploaded_files:
         name = f.name
-        if name.endswith('.pkl'):
-            obj = joblib.load(f)
-            if isinstance(obj, StandardScaler):
-                scaler = obj
-            else:
-                stem = Path(name).stem
-                models[stem] = obj
+        if not name.endswith('.pkl'):
+            continue
+        obj = joblib.load(f)
+        # Scaler?
+        if isinstance(obj, StandardScaler) or (hasattr(obj, "mean_") and hasattr(obj, "scale_")):
+            scaler = obj
+            continue
+        # Else a regressor: map its stem to the RAW key
+        stem = Path(name).stem
+        raw_key = _normalize_stem_to_raw(stem)
+        if raw_key is None:
+            # fallback: keep original stem to not lose the model
+            raw_key = stem
+        models[raw_key] = obj
     return models, scaler
 
 # ---------------------- Sidebar ----------------------
@@ -208,6 +316,10 @@ with st.sidebar.expander("KNN settings", expanded=False):
     tol_speed = st.number_input("Speed window (±m/s)", 0.05, 5.0, 0.5, 0.05)
     k_max = st.slider("Max neighbors (fallback)", 1, 15, 5, 1)
 
+# ---- Auto-fill from GitHub Release if nothing uploaded ----
+# (This makes the app usable anywhere with no manual uploads.)
+models_dict, scaler_obj = _autofill_models_if_none(models_dict, scaler_obj)
+
 st.title("AWG Dual Calculator: KNN matcher + ML direct predictor")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Single-point", "Compare (KNN vs ML)", "Batch", "Explain/AD", "Downloads"])
@@ -233,7 +345,6 @@ with tab1:
             results_rows.append(ml_row)
 
         # KNN
-        knn_out = {}
         if hist_df is not None:
             try:
                 outs, stds, nsel = _knn_match(hist_df, temp, rh, speed, tol_temp, tol_rh, tol_speed, k_max)
@@ -276,7 +387,7 @@ with tab2:
             outs, stds, nsel = _knn_match(hist_df, temp_c, rh_c, spd_c, tol_temp, tol_rh, tol_speed, k_max)
             rows.append(_pack_predictions_row(temp_c, rh_c, spd_c, area, outs) | {'Model': f'KNN (n={nsel})'})
 
-    # Display
+        # Display
         if rows:
             df = pd.DataFrame(rows)
             st.dataframe(df[['Model'] + TARGETS + DERIVED_METRICS], use_container_width=True)
@@ -363,7 +474,7 @@ with tab4:
         if shap is None:
             st.error("SHAP not installed. Please ensure 'shap' is in requirements.")
         elif not models_dict:
-            st.warning("Upload ML models first.")
+            st.warning("Upload ML models first or ensure auto-download succeeded.")
         else:
             try:
                 feats, feat_names = _build_feature_vector(t_e, rh_e, sp_e)
@@ -402,6 +513,6 @@ with tab5:
             df.to_csv(buf, index=False)
             st.download_button(label=label, data=buf.getvalue(), file_name=f"{key}.csv", mime="text/csv")
 
-st.caption("Tip: Save this script as 'awg_app.py' and run locally with:  \n"
-           "`streamlit run awg_app.py`  \n"
-           "For cloud deploy, include a matching 'requirements.txt' and upload your '.pkl' models as app secrets or in the repo.")
+st.caption("Tip: Save this script as 'awg_app.py' and run locally with:\n"
+           "`pip install -r requirements.txt && streamlit run awg_app.py`\n"
+           "For cloud deploy, include a matching 'requirements.txt'.")
