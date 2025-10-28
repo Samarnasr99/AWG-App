@@ -507,47 +507,67 @@ with tab1:
 
 # =============================== Compare =====================================
 with tab2:
-    st.subheader("Side-by-side comparison")
-    c1, c2, c3, c4 = st.columns(4)
-    temp_c = c1.number_input("Temperature (°C)", -10.0, 60.0, 35.0, 0.1, key="cmp_t")
-    rh_c   = c2.number_input("RH (%)", 1.0, 100.0, 70.0, 0.1, key="cmp_rh")
-    spd_c  = c3.number_input("Speed (m/s)", 0.0, 30.0, 0.5, 0.1, key="cmp_spd")
-    do_cmp = c4.button("Compare", use_container_width=True, key="cmp_btn")
+    st.subheader("Compare two scenarios")
 
-    if do_cmp:
-        rows, ml_row, knn_row = [], None, None
-        if models_dict:
-            feats, feat_names = _build_feature_vector(temp_c, rh_c, spd_c)
-            ml_out = _predict_direct(models_dict, scaler_obj, feats, feat_names)
-            ml_row = _pack_predictions_row(temp_c, rh_c, spd_c, ml_out) | {'Model': 'ML-direct'}
-            rows.append(ml_row)
-        if hist_df is not None:
-            outs, stds, nsel = _knn_match(hist_df, temp_c, rh_c, spd_c, tol_temp, tol_rh, tol_speed, k_max)
-            knn_row = _pack_predictions_row(temp_c, rh_c, spd_c, outs) | {'Model': f'KNN (n={nsel})'}
-            rows.append(knn_row)
+    colA, colB = st.columns(2)
+    with colA:
+        st.markdown("**Scenario A**")
+        tA = st.number_input("A • Temperature (°C)", -10.0, 60.0, 35.0, 0.1, key="cmp_A_t")
+        rhA = st.number_input("A • RH (%)", 1.0, 100.0, 70.0, 0.1, key="cmp_A_rh")
+        sA = st.number_input("A • Speed (m/s)", 0.0, 30.0, 0.5, 0.1, key="cmp_A_spd")
 
-        if rows:
-            df = pd.DataFrame(rows)
-            order_cols = ['Model'] + TARGETS + DERIVED_METRICS
-            df_show = _safe_reindex(df, order_cols)
+    with colB:
+        st.markdown("**Scenario B**")
+        tB = st.number_input("B • Temperature (°C)", -10.0, 60.0, 38.0, 0.1, key="cmp_B_t")
+        rhB = st.number_input("B • RH (%)", 1.0, 100.0, 60.0, 0.1, key="cmp_B_rh")
+        sB = st.number_input("B • Speed (m/s)", 0.0, 30.0, 1.0, 0.1, key="cmp_B_spd")
+
+    mode = st.radio("Model used for comparison", ["ML-direct", "KNN"], horizontal=True, key="cmp_mode")
+    run_cmp = st.button("Compare scenarios", use_container_width=True, key="cmp_run")
+
+    def _row_for_scenario(temp, rh, spd, method: str):
+        if method == "ML-direct":
+            if not models_dict:
+                st.warning("ML models not available. Upload or let the app auto-download them.")
+                return None
+            feats, feat_names = _build_feature_vector(temp, rh, spd)
+            outs = _predict_direct(models_dict, scaler_obj, feats, feat_names)
+            return _pack_predictions_row(temp, rh, spd, outs) | {'Model': 'ML-direct'}
+        else:  # KNN
+            if hist_df is None:
+                st.warning("KNN dataset not available. Upload or let the app auto-download it.")
+                return None
+            outs, stds, nsel = _knn_match(hist_df, temp, rh, spd, tol_temp, tol_rh, tol_speed, k_max)
+            row = _pack_predictions_row(temp, rh, spd, outs) | {'Model': f'KNN (n={nsel})'}
+            # attach relative scatter as STD% columns (optional)
+            for k, v in stds.items():
+                if k in outs and outs[k] != 0:
+                    row[f"{k} STD%"] = 100.0 * v / abs(outs[k])
+            return row
+
+    if run_cmp:
+        rowA = _row_for_scenario(tA, rhA, sA, mode)
+        rowB = _row_for_scenario(tB, rhB, sB, mode)
+
+        if rowA and rowB:
+            order_cols = ['Model'] + EXPECTED_INPUTS + TARGETS + DERIVED_METRICS
+            df = pd.DataFrame([rowA, rowB])
+            df_show = df.reindex(columns=[c for c in order_cols if c in df.columns])
             _display_df(df_show)
 
-            if len(rows) == 2:
-                deltas = {k: (rows[0].get(k, np.nan) if rows[0].get(k) is not None else np.nan)
-                             - (rows[1].get(k, np.nan) if rows[1].get(k) is not None else np.nan)
-                          for k in TARGETS + DERIVED_METRICS}
-                deltas_df = pd.DataFrame([deltas])
-                st.caption("ML-direct minus KNN (positive means ML higher):")
-                _display_df(deltas_df)
+            # Delta: B - A
+            deltas = {k: (rowB.get(k, np.nan) if rowB.get(k) is not None else np.nan) -
+                          (rowA.get(k, np.nan) if rowA.get(k) is not None else np.nan)
+                      for k in TARGETS + DERIVED_METRICS}
+            st.caption("Δ (Scenario B − Scenario A)")
+            _display_df(pd.DataFrame([deltas]))
 
-            st.session_state['last_compare_df'] = df_show
-
-            vals_ml  = _build_plot_payload(ml_row or rows[0])
-            vals_knn = _build_plot_payload(knn_row) if knn_row else None
-            fig = _bar_chart_with_optional_error(vals_ml, vals_knn)
-            if fig is not None: st.pyplot(fig, use_container_width=True)
-        else:
-            st.warning("Provide both a dataset and model artifacts to compare.")
+            # Bar plot: Scenario A as bars, Scenario B as “±%” (shown as error)
+            vals_A = _build_plot_payload(rowA)
+            vals_B = _build_plot_payload(rowB)
+            fig = _bar_chart_with_optional_error(vals_A, vals_B)
+            if fig is not None:
+                st.pyplot(fig, use_container_width=True)
 
 # ================================ Batch ======================================
 with tab3:
