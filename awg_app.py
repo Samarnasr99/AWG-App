@@ -1,8 +1,9 @@
 # awg_app.py — Streamlit app for AWG predictions (ML-direct + KNN)
+# - Airflow for KPIs is fixed internally at 90,000 m³/h (no UI text)
 # - Area removed from UI & outputs
-# - Airflow for KPIs fixed at 90,000 m³/h (independent of speed/area)
-# - Wind speed control remains and is used by ML/KNN
+# - Wind speed input remains for ML/KNN
 # - Default models & dataset auto-downloaded from GitHub Releases
+# - Robust header aliasing for KNN inputs
 
 import io
 import math
@@ -38,18 +39,22 @@ st.set_page_config(page_title="AWG Dual Calculator (KNN + ML)", layout="wide")
 
 # ---------------------- Constants / Mappings ----------------------
 
+# fixed airflow for KPI metrics (not shown in UI)
+_AIRFLOW_M3PH = 90_000.0
+
 EXPECTED_INPUTS = [
     'Wind_in_temperature (°C)',
     'Wind_in_rh (%)',
-    'Wind_in_speed (m/s)'
+    'Wind_in_speed (m/s)',
 ]
+
 TARGETS = [
     'Water production (L/h)',
     'Power (kW)',
     'DO (mg/L)',
     'ph',
     'Conductivity (µS/cm)',
-    'Turbidity (NTU)'
+    'Turbidity (NTU)',
 ]
 
 RAW_TARGET_TO_STD = {
@@ -139,13 +144,13 @@ def _autofill_models_if_none(
 def calc_metrics(temp_c: float, rh_pct: float, speed_ms: float,
                  water_lph: float, power_kw: float):
     """Derived KPIs with airflow fixed at 90,000 m³/h."""
-    h_fg_kj_per_kg = 2260.0  # latent heat of vaporization (~kJ/kg)
+    h_fg_kj_per_kg = 2260.0
     p_sat_kpa = 0.6108 * math.exp((17.27 * temp_c) / (temp_c + 237.3))
     p_vapor_kpa = (rh_pct / 100.0) * p_sat_kpa
     abs_humidity_g_per_m3 = (216.7 * p_vapor_kpa) / (temp_c + 273.15)
     abs_humidity_kg_per_m3 = abs_humidity_g_per_m3 / 1000.0
 
-    air_volume_m3ph = 90000.0  # fixed airflow
+    air_volume_m3ph = _AIRFLOW_M3PH  # fixed
     total_water_air_kgph = air_volume_m3ph * abs_humidity_kg_per_m3
 
     sec = (power_kw) / (water_lph) if water_lph > 0 else float("inf")
@@ -155,7 +160,8 @@ def calc_metrics(temp_c: float, rh_pct: float, speed_ms: float,
 
 def nice_float(x, nd=3):
     try:
-        if x is None: return None
+        if x is None:
+            return None
         if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
             return None
         return float(f"{x:.{nd}f}")
@@ -173,32 +179,70 @@ def _read_dataframe(uploaded_file) -> pd.DataFrame:
 # ----- column aliasing to avoid KNN KeyError -----
 COL_ALIASES = {
     'Wind_in_temperature (°C)': {
-        'wind_in_temperature (°c)', 'wind_in_temperature', 'temperature (°c)',
-        'temperature', 'temp', 't'
+        'wind_in_temperature (°c)', 'wind_in_temperature', 'wind_in_temp',
+        'windintemperature', 'temperature (°c)', 'temperature', 'temp', 't', 'temp_c'
     },
     'Wind_in_rh (%)': {
-        'wind_in_rh (%)', 'rh (%)', 'relative humidity (%)', 'relative humidity',
-        'rh', 'humidity'
+        'wind_in_rh (%)', 'wind_in_rh', 'windinrh', 'wind_rh',
+        'rh (%)', 'relative humidity (%)', 'relative humidity', 'rh', 'humidity'
     },
     'Wind_in_speed (m/s)': {
-        'wind_in_speed (m/s)', 'wind speed (m/s)', 'speed (m/s)', 'speed', 'v'
+        'wind_in_speed (m/s)', 'wind_in_speed', 'windspeed', 'wind_speed',
+        'wind speed (m/s)', 'wind speed', 'speed (m/s)', 'speed', 'v', 'u'
     },
 }
+
 def _normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
-    lower_map = {c.lower().strip(): c for c in df.columns}
-    ren = {}
+    """Rename common variants of the three input columns to expected names."""
+    if df is None or df.empty:
+        return df
+
+    def norm(s: str) -> str:
+        return s.lower().strip().replace(' ', '').replace('_', '')
+
+    norm_map = {norm(c): c for c in df.columns}
+    renames: Dict[str, str] = {}
+
     for target, aliases in COL_ALIASES.items():
         if target in df.columns:
             continue
-        found = None
-        for a in aliases:
-            if a in lower_map:
-                found = lower_map[a]
-                break
-        if found:
-            ren[found] = target
-    if ren:
-        df = df.rename(columns=ren)
+        found_col = None
+
+        # Alias matches (in several normalization styles)
+        for alias in aliases:
+            # exact normalized key
+            if alias in norm_map:
+                found_col = norm_map[alias]; break
+            alias_norm = alias.lower().strip()
+            for c in df.columns:
+                if c.lower().strip() == alias_norm:
+                    found_col = c; break
+            if found_col: break
+            alias_key = norm(alias)
+            if alias_key in norm_map:
+                found_col = norm_map[alias_key]; break
+
+        # Heuristics
+        if not found_col:
+            wanted = norm(target)
+            for c in df.columns:
+                if norm(c) == wanted:
+                    found_col = c; break
+        if not found_col:
+            for c in df.columns:
+                cn = norm(c)
+                if 'temperature' in target.lower() and ('temp' in cn or 'temperature' in cn):
+                    found_col = c; break
+                if 'rh' in target.lower() and ('rh' in cn or 'humidity' in cn):
+                    found_col = c; break
+                if 'speed' in target.lower() and ('speed' in cn):
+                    found_col = c; break
+
+        if found_col:
+            renames[found_col] = target
+
+    if renames:
+        df = df.rename(columns=renames)
     return df
 
 def _pack_predictions_row(temp, rh, speed, outputs_dict):
@@ -389,7 +433,6 @@ with st.sidebar.expander("KNN settings", expanded=False):
 models_dict, scaler_obj = _autofill_models_if_none(models_dict, scaler_obj)
 
 st.title("AWG Dual Calculator: KNN matcher + ML direct predictor")
-st.caption("Assumption: **Airflow used for KPIs is fixed at 90,000 m³/h**. Wind speed still affects KNN filtering and ML feature engineering; it does **not** change airflow in KPI calculations.")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Single-point", "Compare (KNN vs ML)", "Batch", "Explain/AD", "Downloads"])
 
@@ -423,7 +466,6 @@ with tab1:
             st.warning("Please upload either model artifacts (for ML-direct) or ensure the default models/dataset loaded.")
         else:
             order_cols = ['Model'] + EXPECTED_INPUTS + TARGETS + DERIVED_METRICS
-            # add any STD% if present
             extra = [c for c in rows[0].keys() if c.endswith('STD%')]
             df_show = pd.DataFrame(rows)[order_cols + extra]
             df_show = df_show.applymap(lambda z: nice_float(z, 3) if isinstance(z, (float, np.floating)) else z)
