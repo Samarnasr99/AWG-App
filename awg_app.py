@@ -1,4 +1,4 @@
-# awg_app.py — auto-download models from GitHub Release + robust local upload mapping
+# awg_app.py — auto-download models & default dataset from GitHub Release + robust local upload mapping
 
 import io
 import math
@@ -40,13 +40,12 @@ RAW_TARGET_TO_STD = {
     'Conductivity': 'Conductivity (µS/cm)',
     'water_turb': 'Turbidity (NTU)',
 }
-# Reverse map: std -> raw
+# Reverse map
 STD_TO_RAW_TARGET = {v: k for k, v in RAW_TARGET_TO_STD.items()}
 
 DERIVED_METRICS = ['SEC (kWh/L)', 'COP', 'Airborne water (kg/h)', 'Capture efficiency (%)']
 
-# ---- YOUR GITHUB RELEASE ASSETS (exact URLs provided) ----
-# (We also read env/secrets to allow overriding without code changes.)
+# ---- YOUR GITHUB RELEASE ASSETS (exact URLs) ----
 DEFAULT_MODEL_URLS = {
     "scaler_final_model_set": os.environ.get("SCALER_URL", st.secrets.get("SCALER_URL", "https://github.com/Samarnasr99/AWG-App/releases/download/Models/scaler_final_model_set.pkl")),
     "Water production (L)":   os.environ.get("WATER_URL",  st.secrets.get("WATER_URL",  "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Water.production.L._final_model.pkl")),
@@ -57,19 +56,44 @@ DEFAULT_MODEL_URLS = {
     "water_turb":             os.environ.get("TURB_URL",   st.secrets.get("TURB_URL",   "https://github.com/Samarnasr99/AWG-App/releases/download/Models/water_turb_final_model.pkl")),
 }
 
-# ---------------------- Caching download helpers ----------------------
+# === Default historical dataset (auto-load if user doesn't upload) ===
+DEFAULT_DATA_URL = os.environ.get(
+    "DATA_URL",
+    st.secrets.get(
+        "DATA_URL",
+        "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Search_and_fit._AWG.xlsx"
+    )
+)
 
+# ---------------------- Caching helpers ----------------------
+
+# cache models/binaries
 try:
-    # modern name
     from streamlit.runtime.caching import cache_resource as st_cache_resource
 except Exception:
     st_cache_resource = st.cache_resource
+
+# cache dataframes
+try:
+    from streamlit.runtime.caching import cache_data as st_cache_data
+except Exception:
+    st_cache_data = st.cache_data
 
 @st_cache_resource(show_spinner=False)
 def _download_joblib(url: str):
     r = requests.get(url, timeout=180)
     r.raise_for_status()
     return joblib.load(BytesIO(r.content))
+
+@st_cache_data(show_spinner=False)
+def _download_table(url: str) -> pd.DataFrame:
+    resp = requests.get(url, timeout=180)
+    resp.raise_for_status()
+    buf = BytesIO(resp.content)
+    if url.lower().endswith(".csv"):
+        return pd.read_csv(buf)
+    else:
+        return pd.read_excel(buf, sheet_name=0)
 
 def _autofill_models_if_none(models_dict: Dict[str, BaseEstimator],
                              scaler_obj: Optional[StandardScaler]):
@@ -93,7 +117,6 @@ def _autofill_models_if_none(models_dict: Dict[str, BaseEstimator],
             if key_raw.startswith("scaler") or (hasattr(obj, "mean_") and hasattr(obj, "scale_")):
                 fetched_scaler = obj
             else:
-                # key_raw is already the desired RAW name
                 fetched_models[key_raw] = obj
         except Exception as e:
             st.warning(f"Could not fetch '{key_raw}' from release: {e}")
@@ -282,8 +305,7 @@ def _load_model_artifacts(uploaded_files: List):
         stem = Path(name).stem
         raw_key = _normalize_stem_to_raw(stem)
         if raw_key is None:
-            # fallback: keep original stem to not lose the model
-            raw_key = stem
+            raw_key = stem  # fallback
         models[raw_key] = obj
     return models, scaler
 
@@ -310,14 +332,21 @@ with st.sidebar.expander("Upload historical dataset for KNN (.csv/.xlsx)", expan
         except Exception as e:
             st.error(f"Failed to read dataset: {e}")
 
+# ---- Auto-fill from GitHub Release if no dataset uploaded ----
+if hist_df is None and DEFAULT_DATA_URL:
+    try:
+        hist_df = _download_table(DEFAULT_DATA_URL)
+        st.caption(f"Loaded default dataset from release: {hist_df.shape}")
+    except Exception as e:
+        st.warning(f"No uploaded dataset and default download failed: {e}")
+
 with st.sidebar.expander("KNN settings", expanded=False):
     tol_temp = st.number_input("Temperature window (±°C)", 0.1, 20.0, 1.0, 0.1)
     tol_rh = st.number_input("RH window (±%)", 0.5, 40.0, 2.0, 0.5)
     tol_speed = st.number_input("Speed window (±m/s)", 0.05, 5.0, 0.5, 0.05)
     k_max = st.slider("Max neighbors (fallback)", 1, 15, 5, 1)
 
-# ---- Auto-fill from GitHub Release if nothing uploaded ----
-# (This makes the app usable anywhere with no manual uploads.)
+# ---- Auto-fill models from GitHub Release if nothing uploaded ----
 models_dict, scaler_obj = _autofill_models_if_none(models_dict, scaler_obj)
 
 st.title("AWG Dual Calculator: KNN matcher + ML direct predictor")
@@ -358,7 +387,7 @@ with tab1:
                 st.error(f"KNN error: {e}")
 
         if not results_rows:
-            st.warning("Please upload either model artifacts (for ML-direct) or a historical dataset (for KNN).")
+            st.warning("Please upload either model artifacts (for ML-direct) or ensure the default models/dataset loaded.")
         else:
             order_cols = ['Model'] + EXPECTED_INPUTS + ['Assumed intake area (m²)'] + TARGETS + DERIVED_METRICS
             add_std_cols = [c for c in (results_rows[0].keys()) if 'STD%' in c]
@@ -513,6 +542,4 @@ with tab5:
             df.to_csv(buf, index=False)
             st.download_button(label=label, data=buf.getvalue(), file_name=f"{key}.csv", mime="text/csv")
 
-st.caption("Tip: Save this script as 'awg_app.py' and run locally with:\n"
-           "`pip install -r requirements.txt && streamlit run awg_app.py`\n"
-           "For cloud deploy, include a matching 'requirements.txt'.")
+st.caption("Tip: Run locally with `pip install -r requirements.txt && streamlit run awg_app.py`. For cloud deploy, include the same requirements.")
