@@ -1,5 +1,6 @@
 # awg_app.py — auto-download models & default dataset from GitHub Release + robust local upload mapping
-# Area and wind speed are FIXED (area=5 m², speed=5 m/s)
+# NOTE: Derived-metrics airflow is FIXED at 90,000 m³/h (air_volume_m3ph = 90000).
+# Wind speed input remains active for ML/KNN logic; only airflow in metrics is constant.
 
 import io
 import math
@@ -32,10 +33,6 @@ import joblib
 import requests
 
 st.set_page_config(page_title="AWG Dual Calculator (KNN + ML)", layout="wide")
-
-# ---------------------- Fixed constants ----------------------
-AREA_FIXED = float(os.environ.get("FIXED_AREA", 5.0))       # m²
-SPEED_FIXED = float(os.environ.get("FIXED_SPEED", 5.0))     # m/s
 
 # ---------------------- Constants / Mappings ----------------------
 
@@ -138,13 +135,17 @@ def _autofill_models_if_none(models_dict: Dict[str, BaseEstimator],
 # ---------------------- Utilities ----------------------
 
 def calc_metrics(temp_c: float, rh_pct: float, speed_ms: float, area_m2: float, water_lph: float, power_kw: float):
-    # Simple psychrometrics approximations
+    """Compute derived KPIs.
+    NOTE: airflow is FIXED at 90,000 m³/h for metrics (independent of speed/area inputs)."""
     h_fg_kj_per_kg = 2260.0  # latent heat of vaporization (~kJ/kg)
     p_sat_kpa = 0.6108 * math.exp((17.27 * temp_c) / (temp_c + 237.3))  # kPa
     p_vapor_kpa = (rh_pct / 100.0) * p_sat_kpa
     abs_humidity_g_per_m3 = (216.7 * p_vapor_kpa) / (temp_c + 273.15)
     abs_humidity_kg_per_m3 = abs_humidity_g_per_m3 / 1000.0
-    air_volume_m3ph = speed_ms * area_m2 * 3600.0
+
+    # ---- fixed airflow here ----
+    air_volume_m3ph = 90000.0
+
     total_water_air_kgph = air_volume_m3ph * abs_humidity_kg_per_m3
     # Metrics
     sec = (power_kw) / (water_lph) if water_lph > 0 else float("inf")
@@ -220,7 +221,6 @@ def _predict_direct(models: Dict[str, BaseEstimator],
                         y_pred = booster.predict(xgb.DMatrix(X))
                     y_val = float(y_pred[0])
             except Exception:
-                # If still failing, re-raise so the user sees a clear error
                 raise
 
         if y_val is not None:
@@ -341,7 +341,7 @@ def _load_model_artifacts(uploaded_files: List):
 # ---------------------- Sidebar ----------------------
 
 st.sidebar.header("Configuration")
-st.sidebar.info(f"**Air intake area is fixed: {AREA_FIXED} m²**\n\n**Wind speed is fixed: {SPEED_FIXED} m/s**")
+area = st.sidebar.number_input("Air intake area (m²)", min_value=0.1, max_value=100.0, value=8.0, step=0.1)
 
 with st.sidebar.expander("Upload ML-direct model artifacts (.pkl)", expanded=False):
     up_models = st.file_uploader(
@@ -379,34 +379,35 @@ with st.sidebar.expander("KNN settings", expanded=False):
 models_dict, scaler_obj = _autofill_models_if_none(models_dict, scaler_obj)
 
 st.title("AWG Dual Calculator: KNN matcher + ML direct predictor")
+st.caption("Assumption: **Airflow for derived metrics is fixed at 90,000 m³/h**. Wind speed still affects KNN filtering and ML feature engineering; it does not change airflow used in the KPI calculations.")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Single-point", "Compare (KNN vs ML)", "Batch", "Explain/AD", "Downloads"])
 
 # --- Single-point
 with tab1:
     st.subheader("Single-point prediction")
-    c1, c2 = st.columns(2)
+    c1, c2, c3, c4 = st.columns(4)
     temp = c1.number_input("Wind_in_temperature (°C)", -10.0, 60.0, 35.0, 0.1)
     rh = c2.number_input("Wind_in_rh (%)", 1.0, 100.0, 70.0, 0.1)
-    st.caption(f"Using fixed wind speed = **{SPEED_FIXED} m/s** and fixed intake area = **{AREA_FIXED} m²**.")
-    do_calc = st.button("Predict", use_container_width=True)
+    speed = c3.number_input("Wind_in_speed (m/s)", 0.0, 30.0, 0.5, 0.1)
+    do_calc = c4.button("Predict", use_container_width=True)
 
     if do_calc:
         results_rows = []
         # ML direct
-        feats, feat_names = _build_feature_vector(temp, rh, SPEED_FIXED)
+        feats, feat_names = _build_feature_vector(temp, rh, speed)
         ml_out = {}
         if models_dict:
             ml_out = _predict_direct(models_dict, scaler_obj, feats, feat_names)
-            ml_row = _pack_predictions_row(temp, rh, SPEED_FIXED, AREA_FIXED, ml_out)
+            ml_row = _pack_predictions_row(temp, rh, speed, area, ml_out)
             ml_row['Model'] = 'ML-direct'
             results_rows.append(ml_row)
 
         # KNN
         if hist_df is not None:
             try:
-                outs, stds, nsel = _knn_match(hist_df, temp, rh, SPEED_FIXED, tol_temp, tol_rh, tol_speed, k_max)
-                knn_row = _pack_predictions_row(temp, rh, SPEED_FIXED, AREA_FIXED, outs)
+                outs, stds, nsel = _knn_match(hist_df, temp, rh, speed, tol_temp, tol_rh, tol_speed, k_max)
+                knn_row = _pack_predictions_row(temp, rh, speed, area, outs)
                 knn_row['Model'] = f'KNN (n={nsel})'
                 for k, v in stds.items():
                     if k in outs and outs[k] != 0:
@@ -429,22 +430,23 @@ with tab1:
 # --- Compare
 with tab2:
     st.subheader("Side-by-side comparison")
-    c1, c2 = st.columns(2)
+    c1, c2, c3, c4 = st.columns(4)
     temp_c = c1.number_input("Temperature (°C)", -10.0, 60.0, 35.0, 0.1, key="cmp_t")
     rh_c = c2.number_input("RH (%)", 1.0, 100.0, 70.0, 0.1, key="cmp_rh")
-    st.caption(f"Speed fixed at **{SPEED_FIXED} m/s**, area fixed at **{AREA_FIXED} m²**.")
-    do_cmp = st.button("Compare", use_container_width=True, key="cmp_btn")
+    spd_c = c3.number_input("Speed (m/s)", 0.0, 30.0, 0.5, 0.1, key="cmp_spd")
+    do_cmp = c4.button("Compare", use_container_width=True, key="cmp_btn")
 
     if do_cmp:
         rows = []
         if models_dict:
-            feats, feat_names = _build_feature_vector(temp_c, rh_c, SPEED_FIXED)
+            feats, feat_names = _build_feature_vector(temp_c, rh_c, spd_c)
             ml_out = _predict_direct(models_dict, scaler_obj, feats, feat_names)
-            rows.append(_pack_predictions_row(temp_c, rh_c, SPEED_FIXED, AREA_FIXED, ml_out) | {'Model': 'ML-direct'})
+            rows.append(_pack_predictions_row(temp_c, rh_c, spd_c, area, ml_out) | {'Model': 'ML-direct'})
         if hist_df is not None:
-            outs, stds, nsel = _knn_match(hist_df, temp_c, rh_c, SPEED_FIXED, tol_temp, tol_rh, tol_speed, k_max)
-            rows.append(_pack_predictions_row(temp_c, rh_c, SPEED_FIXED, AREA_FIXED, outs) | {'Model': f'KNN (n={nsel})'})
+            outs, stds, nsel = _knn_match(hist_df, temp_c, rh_c, spd_c, tol_temp, tol_rh, tol_speed, k_max)
+            rows.append(_pack_predictions_row(temp_c, rh_c, spd_c, area, outs) | {'Model': f'KNN (n={nsel})'})
 
+        # Display
         if rows:
             df = pd.DataFrame(rows)
             st.dataframe(df[['Model'] + TARGETS + DERIVED_METRICS], use_container_width=True)
@@ -461,7 +463,7 @@ with tab2:
 # --- Batch
 with tab3:
     st.subheader("Batch predictions")
-    st.write("Upload a CSV/XLSX with columns: 'Wind_in_temperature (°C)', 'Wind_in_rh (%)'. (Speed is fixed at 5 m/s.)")
+    st.write("Upload a CSV/XLSX with columns: 'Wind_in_temperature (°C)', 'Wind_in_rh (%)', 'Wind_in_speed (m/s)'.")
     batch_file = st.file_uploader("Batch file", type=["csv", "xlsx", "xls"], key="batch")
     mode = st.radio("Compute with", ["ML-direct", "KNN", "Both"], horizontal=True)
     run_batch = st.button("Run batch", use_container_width=True)
@@ -469,28 +471,22 @@ with tab3:
     if run_batch and batch_file is not None:
         try:
             df_in = _read_dataframe(batch_file)
-            # Be tolerant: if speed column exists, ignore it; always use SPEED_FIXED
-            col_t, col_r = EXPECTED_INPUTS[0], EXPECTED_INPUTS[1]
-            if col_t not in df_in.columns or col_r not in df_in.columns:
-                st.error(f"Batch file must include '{col_t}' and '{col_r}'.")
+            out_rows = []
+            for _, r in df_in.iterrows():
+                t, h, s = float(r[EXPECTED_INPUTS[0]]), float(r[EXPECTED_INPUTS[1]]), float(r[EXPECTED_INPUTS[2]])
+                if mode in ["ML-direct", "Both"] and models_dict:
+                    feats, feat_names = _build_feature_vector(t, h, s)
+                    outs = _predict_direct(models_dict, scaler_obj, feats, feat_names)
+                    out_rows.append(_pack_predictions_row(t, h, s, area, outs) | {'Model': 'ML-direct'})
+                if mode in ["KNN", "Both"] and hist_df is not None:
+                    outs, stds, nsel = _knn_match(hist_df, t, h, s, tol_temp, tol_rh, tol_speed, k_max)
+                    out_rows.append(_pack_predictions_row(t, h, s, area, outs) | {'Model': f'KNN (n={nsel})'})
+            if out_rows:
+                df_out = pd.DataFrame(out_rows)
+                st.dataframe(df_out, use_container_width=True)
+                st.session_state['last_batch_df'] = df_out
             else:
-                out_rows = []
-                for _, r in df_in.iterrows():
-                    t, h = float(r[col_t]), float(r[col_r])
-                    s = SPEED_FIXED
-                    if mode in ["ML-direct", "Both"] and models_dict:
-                        feats, feat_names = _build_feature_vector(t, h, s)
-                        outs = _predict_direct(models_dict, scaler_obj, feats, feat_names)
-                        out_rows.append(_pack_predictions_row(t, h, s, AREA_FIXED, outs) | {'Model': 'ML-direct'})
-                    if mode in ["KNN", "Both"] and hist_df is not None:
-                        outs, stds, nsel = _knn_match(hist_df, t, h, s, tol_temp, tol_rh, tol_speed, k_max)
-                        out_rows.append(_pack_predictions_row(t, h, s, AREA_FIXED, outs) | {'Model': f'KNN (n={nsel})'})
-                if out_rows:
-                    df_out = pd.DataFrame(out_rows)
-                    st.dataframe(df_out, use_container_width=True)
-                    st.session_state['last_batch_df'] = df_out
-                else:
-                    st.warning("Nothing computed. Ensure required inputs and uploads are provided.")
+                st.warning("Nothing computed. Ensure required inputs and uploads are provided.")
         except Exception as e:
             st.error(f"Batch error: {e}")
 
@@ -508,10 +504,10 @@ with tab4:
             st.error(f"Could not read features: {e}")
 
     # Single-point SHAP
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     t_e = c1.number_input("Temperature (°C) for explain", -10.0, 60.0, 35.0, 0.1, key="exp_t")
     rh_e = c2.number_input("RH (%) for explain", 1.0, 100.0, 70.0, 0.1, key="exp_rh")
-    st.caption(f"SHAP computed at fixed speed **{SPEED_FIXED} m/s** and area **{AREA_FIXED} m²**.")
+    sp_e = c3.number_input("Speed (m/s) for explain", 0.0, 30.0, 0.5, 0.1, key="exp_sp")
 
     colA, colB = st.columns(2)
     if colA.button("Compute AD flags", use_container_width=True):
@@ -524,8 +520,10 @@ with tab4:
                     bounds[name] = (lo, hi)
             ad_df = pd.DataFrame(bounds, index=['p01', 'p99']).T
             st.dataframe(ad_df, use_container_width=True)
-            inputs_map = {'Wind_in_temperature (°C)': t_e, 'Wind_in_rh (%)': rh_e, 'Wind_in_speed (m/s)': SPEED_FIXED}
-            flags = {nm: (inputs_map[nm] < lo) or (inputs_map[nm] > hi) for nm, (lo, hi) in bounds.items()}
+            flags = {}
+            for nm, (lo, hi) in bounds.items():
+                x = {'Wind_in_temperature (°C)': t_e, 'Wind_in_rh (%)': rh_e, 'Wind_in_speed (m/s)': sp_e}[nm]
+                flags[nm] = (x < lo) or (x > hi)
             st.info(f"Out-of-domain flags (1%/99% bounds): {flags}")
         else:
             st.warning("Upload training features to enable AD bounds.")
@@ -537,7 +535,7 @@ with tab4:
             st.warning("Upload ML models first or ensure auto-download succeeded.")
         else:
             try:
-                feats, feat_names = _build_feature_vector(t_e, rh_e, SPEED_FIXED)
+                feats, feat_names = _build_feature_vector(t_e, rh_e, sp_e)
                 X = feats.reshape(1, -1)
                 if scaler_obj is not None:
                     try:
