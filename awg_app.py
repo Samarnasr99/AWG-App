@@ -1,12 +1,10 @@
 # awg_app.py — Streamlit app for AWG predictions (ML-direct + KNN)
 # - Airflow for KPIs is fixed internally at 90,000 m³/h (no UI text)
-# - Area removed from UI & outputs
-# - Wind speed input remains for ML/KNN and filtering
 # - Default models & dataset auto-downloaded from GitHub Releases
 # - Robust header aliasing for KNN inputs
 # - Horizontal bar charts with optional ±% error bars (ML vs KNN)
 # - Safe column selection to avoid KeyError in tables
-# - Clean DataFrames before display to avoid PyArrow ValueError
+# - Strong Arrow sanitization for all displayed DataFrames
 
 import io
 import math
@@ -43,8 +41,7 @@ st.set_page_config(page_title="AWG Dual Calculator (KNN + ML)", layout="wide")
 
 # ---------------------- Constants / Mappings ----------------------
 
-# fixed airflow for KPI metrics (not shown in UI)
-_AIRFLOW_M3PH = 90_000.0
+_AIRFLOW_M3PH = 90_000.0  # fixed for KPI calculations
 
 EXPECTED_INPUTS = [
     'Wind_in_temperature (°C)',
@@ -123,7 +120,6 @@ def _autofill_models_if_none(
     models_dict: Dict[str, BaseEstimator],
     scaler_obj: Optional[StandardScaler]
 ) -> Tuple[Dict[str, BaseEstimator], Optional[StandardScaler]]:
-    """If user didn't upload, pull artifacts from GitHub Release."""
     have_any = (models_dict and len(models_dict) > 0) or (scaler_obj is not None)
     if have_any:
         return models_dict, scaler_obj
@@ -200,7 +196,6 @@ COL_ALIASES = {
 }
 
 def _normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename common variants of the three input columns to expected names."""
     if df is None or df.empty:
         return df
 
@@ -407,8 +402,6 @@ def _build_plot_payload(row: dict) -> Dict[str, float]:
 
 def _bar_chart_with_optional_error(values_ml: Dict[str, float],
                                    values_knn: Optional[Dict[str, float]] = None):
-    """Draw horizontal bars for ML values; if KNN provided, add ±% error bars
-    where pct = |ML - KNN| / ML * 100, and annotate 'value ±pct%'."""
     labels, nums, xerr, ann = [], [], None, []
     for k in _ORDER_FOR_PLOT:
         if k in values_ml and values_ml[k] is not None:
@@ -442,7 +435,6 @@ def _bar_chart_with_optional_error(values_ml: Dict[str, float],
     ax.set_yticks(y, labels)
     ax.grid(axis="x", linestyle="--", alpha=0.25)
 
-    # annotate "value  ±p%"
     for yi, v, p in zip(y, nums, ann):
         tail = f"  {v:.2f}" + (f"  ±{p:.1f}%" if p > 0 else "")
         ax.text(v, yi, tail, va="center", ha="left", fontsize=9)
@@ -453,19 +445,51 @@ def _bar_chart_with_optional_error(values_ml: Dict[str, float],
 # ---------------------- Table helpers ----------------------
 
 def _safe_reindex(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    """Return df with only columns that actually exist, preserving order."""
     keep = [c for c in cols if c in df.columns]
     return df.reindex(columns=keep)
 
-def _clean_for_display(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert numerics to plain floats and replace NaN/inf with None for Arrow."""
-    def conv(x):
-        if isinstance(x, (int, float, np.integer, np.floating)):
-            if pd.isna(x) or (isinstance(x, float) and (math.isinf(x) or math.isnan(x))):
-                return None
-            return float(x)
+def _sanitize_cell(x):
+    # None stays None
+    if x is None:
+        return None
+    # Pandas / numpy NaN or inf -> None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+    if isinstance(x, float) and (math.isinf(x) or math.isnan(x)):
+        return None
+    # numpy scalar -> python scalar
+    if isinstance(x, np.generic):
+        return x.item()
+    # numeric -> float
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+    # pandas timestamp -> ISO string
+    if isinstance(x, (pd.Timestamp, )):
+        return x.isoformat()
+    # lists/tuples/dicts -> compact string
+    if isinstance(x, (list, tuple, dict, set)):
+        return str(x)
+    # booleans -> bool
+    if isinstance(x, (bool, np.bool_)):
+        return bool(x)
+    # strings -> keep
+    if isinstance(x, str):
         return x
-    return df.applymap(conv)
+    # anything else -> string fallback
+    return str(x)
+
+def _sanitize_for_arrow(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    df2 = df.copy()
+    for col in df2.columns:
+        df2[col] = df2[col].map(_sanitize_cell)
+    # ensure clean index
+    df2 = df2.reset_index(drop=True)
+    return df2
 
 # ---------------------- Sidebar ----------------------
 
@@ -546,17 +570,15 @@ with tab1:
         if not rows:
             st.warning("Please upload either model artifacts (for ML-direct) or ensure the default models/dataset loaded.")
         else:
-            # Safe table
             order_cols = ['Model'] + EXPECTED_INPUTS + TARGETS + DERIVED_METRICS
             df = pd.DataFrame(rows)
             extra = [c for c in df.columns if c.endswith('STD%')]
             df_show = _safe_reindex(df, order_cols + extra)
             df_show = df_show.applymap(lambda z: nice_float(z, 3) if isinstance(z, (float, np.floating)) else z)
-            df_show = _clean_for_display(df_show)
+            df_show = _sanitize_for_arrow(df_show)
             st.dataframe(df_show, use_container_width=True)
             st.session_state['last_single_df'] = df_show
 
-            # Plot: ML with ±% error vs KNN if available (no title)
             vals_ml = _build_plot_payload(ml_row or rows[0])
             vals_knn = _build_plot_payload(knn_row) if knn_row else None
             fig = _bar_chart_with_optional_error(vals_ml, vals_knn)
@@ -590,7 +612,7 @@ with tab2:
             df = pd.DataFrame(rows)
             order_cols = ['Model'] + TARGETS + DERIVED_METRICS
             df_show = _safe_reindex(df, order_cols)
-            df_show = _clean_for_display(df_show)
+            df_show = _sanitize_for_arrow(df_show)
             st.dataframe(df_show, use_container_width=True)
 
             if len(rows) == 2:
@@ -600,13 +622,12 @@ with tab2:
                     for k in TARGETS + DERIVED_METRICS
                 }
                 deltas_df = pd.DataFrame([deltas])
-                deltas_df = _clean_for_display(deltas_df)
+                deltas_df = _sanitize_for_arrow(deltas_df)
                 st.caption("ML-direct minus KNN (positive means ML higher):")
                 st.dataframe(deltas_df, use_container_width=True)
 
             st.session_state['last_compare_df'] = df_show
 
-            # Plot: ML with ±% error vs KNN (no title)
             vals_ml = _build_plot_payload(ml_row or rows[0])
             vals_knn = _build_plot_payload(knn_row) if knn_row else None
             fig = _bar_chart_with_optional_error(vals_ml, vals_knn)
@@ -639,7 +660,7 @@ with tab3:
                     out_rows.append(_pack_predictions_row(t, h, s, outs) | {'Model': f'KNN (n={nsel})'})
             if out_rows:
                 df_out = pd.DataFrame(out_rows)
-                df_out = _clean_for_display(df_out)
+                df_out = _sanitize_for_arrow(df_out)
                 st.dataframe(df_out, use_container_width=True)
                 st.session_state['last_batch_df'] = df_out
             else:
@@ -675,7 +696,7 @@ with tab4:
                     lo, hi = np.percentile(train_feats[name].dropna().to_numpy(), [1, 99])
                     bounds[name] = (lo, hi)
             ad_df = pd.DataFrame(bounds, index=['p01', 'p99']).T
-            ad_df = _clean_for_display(ad_df)
+            ad_df = _sanitize_for_arrow(ad_df)
             st.dataframe(ad_df, use_container_width=True)
             flags = {nm: (val := {'Wind_in_temperature (°C)': t_e, 'Wind_in_rh (%)': rh_e, 'Wind_in_speed (m/s)': sp_e}[nm]) < bounds[nm][0] or val > bounds[nm][1]
                      for nm in bounds}
@@ -706,7 +727,7 @@ with tab4:
                     sv = explainer(X)
                     vals = sv.values[0] if hasattr(sv, "values") else sv[0].values
                     shap_df = pd.DataFrame({'feature': feat_names, 'shap_value': vals})
-                    shap_df = _clean_for_display(shap_df)
+                    shap_df = _sanitize_for_arrow(shap_df)
                     st.dataframe(shap_df, use_container_width=True)
                     st.session_state['last_shap_df'] = shap_df
                     st.caption("Bar chart of SHAP values")
