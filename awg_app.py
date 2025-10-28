@@ -1,11 +1,11 @@
 # awg_app.py — Streamlit app for AWG predictions (ML-direct + KNN)
 # - Airflow for KPIs is fixed internally at 90,000 m³/h (no UI text)
 # - Area removed from UI & outputs
-# - Wind speed input remains for ML/KNN
+# - Wind speed input remains for ML/KNN and filtering
 # - Default models & dataset auto-downloaded from GitHub Releases
 # - Robust header aliasing for KNN inputs
 # - Horizontal bar charts with optional ±% error bars (ML vs KNN)
-# - Safe dataframe column selection to avoid KeyErrors
+# - Safe column selection to avoid KeyError in tables
 
 import io
 import math
@@ -395,6 +395,7 @@ def _load_model_artifacts(uploaded_files: List):
     return models, scaler
 
 # ---------------------- Plot helpers ----------------------
+
 _ORDER_FOR_PLOT = [
     'Water production (L/h)', 'Power (kW)', 'DO (mg/L)', 'ph',
     'Conductivity (µS/cm)', 'Turbidity (NTU)', 'SEC (kWh/L)', 'COP', 'Efficiency (%)'
@@ -425,7 +426,6 @@ def _bar_chart_with_optional_error(values_ml: Dict[str, float],
             else:
                 pct, err_abs = 0.0, 0.0
             ann.append(pct)
-            # collect xerr per-bar
             if xerr is None: xerr = []
             xerr.append(err_abs)
 
@@ -448,6 +448,13 @@ def _bar_chart_with_optional_error(values_ml: Dict[str, float],
 
     plt.tight_layout()
     return fig
+
+# ---------------------- Table helper (fix KeyError) ----------------------
+
+def _safe_reindex(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    """Return df with only columns that actually exist, preserving order."""
+    keep = [c for c in cols if c in df.columns]
+    return df.reindex(columns=keep)
 
 # ---------------------- Sidebar ----------------------
 
@@ -528,14 +535,16 @@ with tab1:
         if not rows:
             st.warning("Please upload either model artifacts (for ML-direct) or ensure the default models/dataset loaded.")
         else:
+            # Safe table
             order_cols = ['Model'] + EXPECTED_INPUTS + TARGETS + DERIVED_METRICS
-            extra = [c for c in rows[0].keys() if c.endswith('STD%')]
-            df_show = pd.DataFrame(rows)[order_cols + extra]
+            df = pd.DataFrame(rows)
+            extra = [c for c in df.columns if c.endswith('STD%')]
+            df_show = _safe_reindex(df, order_cols + extra)
             df_show = df_show.applymap(lambda z: nice_float(z, 3) if isinstance(z, (float, np.floating)) else z)
             st.dataframe(df_show, use_container_width=True)
             st.session_state['last_single_df'] = df_show
 
-            # ---- Plot: ML with ±% error vs KNN if available
+            # Plot: ML with ±% error vs KNN if available (no title)
             vals_ml = _build_plot_payload(ml_row or rows[0])
             vals_knn = _build_plot_payload(knn_row) if knn_row else None
             fig = _bar_chart_with_optional_error(vals_ml, vals_knn)
@@ -567,7 +576,10 @@ with tab2:
 
         if rows:
             df = pd.DataFrame(rows)
-            st.dataframe(df[['Model'] + TARGETS + DERIVED_METRICS], use_container_width=True)
+            order_cols = ['Model'] + TARGETS + DERIVED_METRICS
+            df_show = _safe_reindex(df, order_cols)
+            st.dataframe(df_show, use_container_width=True)
+
             if len(rows) == 2:
                 deltas = {
                     k: (rows[0].get(k, np.nan) if rows[0].get(k) is not None else np.nan)
@@ -576,9 +588,10 @@ with tab2:
                 }
                 st.caption("ML-direct minus KNN (positive means ML higher):")
                 st.dataframe(pd.DataFrame([deltas]), use_container_width=True)
-            st.session_state['last_compare_df'] = df
 
-            # ---- Plot: ML with ±% error vs KNN
+            st.session_state['last_compare_df'] = df_show
+
+            # Plot: ML with ±% error vs KNN (no title)
             vals_ml = _build_plot_payload(ml_row or rows[0])
             vals_knn = _build_plot_payload(knn_row) if knn_row else None
             fig = _bar_chart_with_optional_error(vals_ml, vals_knn)
