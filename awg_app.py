@@ -1,14 +1,5 @@
-# awg_app.py — Streamlit app for AWG predictions (ML-direct + KNN)
-# - Airflow for KPIs is fixed internally at 90,000 m³/h (no UI text)
-# - Default models & dataset auto-downloaded from GitHub Releases
-# - Robust header aliasing for KNN inputs
-# - Horizontal bar charts with optional ±% error bars (ML vs KNN)
-# - Safe column selection to avoid KeyError in tables
-# - Strong Arrow sanitization for all displayed DataFrames
-
-import io
-import math
-import os
+# awg_app.py — AWG predictions (ML-direct + KNN) with robust DataFrame display
+import io, math, os
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -24,7 +15,6 @@ try:
 except Exception:
     shap = None
 
-# XGBoost fallback (for sklearn-wrapper quirks)
 try:
     import xgboost as xgb
 except Exception:
@@ -34,14 +24,12 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import KDTree
 from sklearn.utils.validation import check_is_fitted
 from sklearn.base import BaseEstimator
-import joblib
-import requests
+import joblib, requests
 
 st.set_page_config(page_title="AWG Dual Calculator (KNN + ML)", layout="wide")
 
-# ---------------------- Constants / Mappings ----------------------
-
-_AIRFLOW_M3PH = 90_000.0  # fixed for KPI calculations
+# ============================ Constants / Mappings ============================
+_AIRFLOW_M3PH = 90_000.0  # fixed airflow for KPI calculations
 
 EXPECTED_INPUTS = [
     'Wind_in_temperature (°C)',
@@ -73,7 +61,6 @@ STD_TO_RAW_TARGET = {v: k for k, v in RAW_TARGET_TO_STD.items()}
 
 DERIVED_METRICS = ['SEC (kWh/L)', 'COP', 'Airborne water (kg/h)', 'Capture efficiency (%)']
 
-# ---- GitHub Release assets ----
 DEFAULT_MODEL_URLS = {
     "scaler_final_model_set": os.environ.get("SCALER_URL", st.secrets.get("SCALER_URL", "https://github.com/Samarnasr99/AWG-App/releases/download/Models/scaler_final_model_set.pkl")),
     "Water production (L)":   os.environ.get("WATER_URL",  st.secrets.get("WATER_URL",  "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Water.production.L._final_model.pkl")),
@@ -83,19 +70,13 @@ DEFAULT_MODEL_URLS = {
     "Conductivity":           os.environ.get("COND_URL",   st.secrets.get("COND_URL",   "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Conductivity_final_model.pkl")),
     "water_turb":             os.environ.get("TURB_URL",   st.secrets.get("TURB_URL",   "https://github.com/Samarnasr99/AWG-App/releases/download/Models/water_turb_final_model.pkl")),
 }
+DEFAULT_DATA_URL = os.environ.get("DATA_URL", st.secrets.get("DATA_URL", "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Search_and_fit._AWG.xlsx"))
 
-DEFAULT_DATA_URL = os.environ.get(
-    "DATA_URL",
-    st.secrets.get("DATA_URL", "https://github.com/Samarnasr99/AWG-App/releases/download/Models/Search_and_fit._AWG.xlsx")
-)
-
-# ---------------------- Caching helpers ----------------------
-
+# =============================== Caching =====================================
 try:
     from streamlit.runtime.caching import cache_resource as st_cache_resource
 except Exception:
     st_cache_resource = st.cache_resource
-
 try:
     from streamlit.runtime.caching import cache_data as st_cache_data
 except Exception:
@@ -103,33 +84,22 @@ except Exception:
 
 @st_cache_resource(show_spinner=False)
 def _download_joblib(url: str):
-    r = requests.get(url, timeout=180)
-    r.raise_for_status()
+    r = requests.get(url, timeout=180); r.raise_for_status()
     return joblib.load(BytesIO(r.content))
 
 @st_cache_data(show_spinner=False)
 def _download_table(url: str) -> pd.DataFrame:
-    resp = requests.get(url, timeout=180)
-    resp.raise_for_status()
+    resp = requests.get(url, timeout=180); resp.raise_for_status()
     buf = BytesIO(resp.content)
-    if url.lower().endswith(".csv"):
-        return pd.read_csv(buf)
-    return pd.read_excel(buf, sheet_name=0)
+    return pd.read_csv(buf) if url.lower().endswith(".csv") else pd.read_excel(buf, sheet_name=0)
 
-def _autofill_models_if_none(
-    models_dict: Dict[str, BaseEstimator],
-    scaler_obj: Optional[StandardScaler]
+def _autofill_models_if_none(models_dict: Dict[str, BaseEstimator], scaler_obj: Optional[StandardScaler]
 ) -> Tuple[Dict[str, BaseEstimator], Optional[StandardScaler]]:
     have_any = (models_dict and len(models_dict) > 0) or (scaler_obj is not None)
-    if have_any:
-        return models_dict, scaler_obj
-
-    fetched_models: Dict[str, BaseEstimator] = {}
-    fetched_scaler: Optional[StandardScaler] = None
-
+    if have_any: return models_dict, scaler_obj
+    fetched_models, fetched_scaler = {}, None
     for key_raw, url in DEFAULT_MODEL_URLS.items():
-        if not url:
-            continue
+        if not url: continue
         try:
             obj = _download_joblib(url)
             if key_raw.startswith("scaler") or (hasattr(obj, "mean_") and hasattr(obj, "scale_")):
@@ -138,24 +108,18 @@ def _autofill_models_if_none(
                 fetched_models[key_raw] = obj
         except Exception as e:
             st.warning(f"Could not fetch '{key_raw}' from release: {e}")
-
     return (fetched_models if fetched_models else models_dict,
             fetched_scaler if fetched_scaler is not None else scaler_obj)
 
-# ---------------------- Utilities ----------------------
-
-def calc_metrics(temp_c: float, rh_pct: float, speed_ms: float,
-                 water_lph: float, power_kw: float):
-    """Derived KPIs with airflow fixed at 90,000 m³/h."""
+# =============================== Utilities ===================================
+def calc_metrics(temp_c: float, rh_pct: float, speed_ms: float, water_lph: float, power_kw: float):
     h_fg_kj_per_kg = 2260.0
     p_sat_kpa = 0.6108 * math.exp((17.27 * temp_c) / (temp_c + 237.3))
     p_vapor_kpa = (rh_pct / 100.0) * p_sat_kpa
     abs_humidity_g_per_m3 = (216.7 * p_vapor_kpa) / (temp_c + 273.15)
     abs_humidity_kg_per_m3 = abs_humidity_g_per_m3 / 1000.0
-
-    air_volume_m3ph = _AIRFLOW_M3PH  # fixed
+    air_volume_m3ph = _AIRFLOW_M3PH
     total_water_air_kgph = air_volume_m3ph * abs_humidity_kg_per_m3
-
     sec = (power_kw) / (water_lph) if water_lph > 0 else float("inf")
     cop = (water_lph * h_fg_kj_per_kg) / (power_kw * 3600.0) if power_kw > 0 else 0.0
     efficiency = (water_lph / (total_water_air_kgph * 1.0)) * 100.0 if total_water_air_kgph > 0 else 0.0
@@ -163,86 +127,53 @@ def calc_metrics(temp_c: float, rh_pct: float, speed_ms: float,
 
 def nice_float(x, nd=3):
     try:
-        if x is None:
-            return None
-        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
-            return None
+        if x is None: return None
+        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)): return None
         return float(f"{x:.{nd}f}")
     except Exception:
         return x
 
 def _read_dataframe(uploaded_file) -> pd.DataFrame:
     suffix = Path(uploaded_file.name).suffix.lower()
-    if suffix == ".csv":
-        return pd.read_csv(uploaded_file)
-    if suffix in {".xlsx", ".xlsm", ".xls"}:
-        return pd.read_excel(uploaded_file, sheet_name=0)
+    if suffix == ".csv": return pd.read_csv(uploaded_file)
+    if suffix in {".xlsx", ".xlsm", ".xls"}: return pd.read_excel(uploaded_file, sheet_name=0)
     return pd.read_csv(uploaded_file)
 
-# ----- column aliasing to avoid KNN KeyError -----
+# ---- Column aliasing (avoid KeyError) ----
 COL_ALIASES = {
-    'Wind_in_temperature (°C)': {
-        'wind_in_temperature (°c)', 'wind_in_temperature', 'wind_in_temp',
-        'windintemperature', 'temperature (°c)', 'temperature', 'temp', 't', 'temp_c'
-    },
-    'Wind_in_rh (%)': {
-        'wind_in_rh (%)', 'wind_in_rh', 'windinrh', 'wind_rh',
-        'rh (%)', 'relative humidity (%)', 'relative humidity', 'rh', 'humidity'
-    },
-    'Wind_in_speed (m/s)': {
-        'wind_in_speed (m/s)', 'wind_in_speed', 'windspeed', 'wind_speed',
-        'wind speed (m/s)', 'wind speed', 'speed (m/s)', 'speed', 'v', 'u'
-    },
+    'Wind_in_temperature (°C)': {'wind_in_temperature (°c)','wind_in_temperature','wind_in_temp','windintemperature','temperature (°c)','temperature','temp','t','temp_c'},
+    'Wind_in_rh (%)': {'wind_in_rh (%)','wind_in_rh','windinrh','wind_rh','rh (%)','relative humidity (%)','relative humidity','rh','humidity'},
+    'Wind_in_speed (m/s)': {'wind_in_speed (m/s)','wind_in_speed','windspeed','wind_speed','wind speed (m/s)','wind speed','speed (m/s)','speed','v','u'},
 }
 
 def _normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-
-    def norm(s: str) -> str:
-        return s.lower().strip().replace(' ', '').replace('_', '')
-
+    if df is None or df.empty: return df
+    def norm(s: str) -> str: return s.lower().strip().replace(' ', '').replace('_', '')
     norm_map = {norm(c): c for c in df.columns}
     renames: Dict[str, str] = {}
-
     for target, aliases in COL_ALIASES.items():
-        if target in df.columns:
-            continue
+        if target in df.columns: continue
         found_col = None
-
         for alias in aliases:
-            if alias in norm_map:
-                found_col = norm_map[alias]; break
+            if alias in norm_map: found_col = norm_map[alias]; break
             alias_norm = alias.lower().strip()
             for c in df.columns:
-                if c.lower().strip() == alias_norm:
-                    found_col = c; break
+                if c.lower().strip() == alias_norm: found_col = c; break
             if found_col: break
             alias_key = norm(alias)
-            if alias_key in norm_map:
-                found_col = norm_map[alias_key]; break
-
+            if alias_key in norm_map: found_col = norm_map[alias_key]; break
         if not found_col:
             wanted = norm(target)
             for c in df.columns:
-                if norm(c) == wanted:
-                    found_col = c; break
+                if norm(c) == wanted: found_col = c; break
         if not found_col:
             for c in df.columns:
                 cn = norm(c)
-                if 'temperature' in target.lower() and ('temp' in cn or 'temperature' in cn):
-                    found_col = c; break
-                if 'rh' in target.lower() and ('rh' in cn or 'humidity' in cn):
-                    found_col = c; break
-                if 'speed' in target.lower() and ('speed' in cn):
-                    found_col = c; break
-
-        if found_col:
-            renames[found_col] = target
-
-    if renames:
-        df = df.rename(columns=renames)
-    return df
+                if 'temperature' in target.lower() and ('temp' in cn or 'temperature' in cn): found_col = c; break
+                if 'rh' in target.lower() and ('rh' in cn or 'humidity' in cn): found_col = c; break
+                if 'speed' in target.lower() and ('speed' in cn): found_col = c; break
+        if found_col: renames[found_col] = target
+    return df.rename(columns=renames) if renames else df
 
 def _pack_predictions_row(temp, rh, speed, outputs_dict):
     water = outputs_dict.get('Water production (L/h)', 0.0) or 0.0
@@ -254,31 +185,19 @@ def _pack_predictions_row(temp, rh, speed, outputs_dict):
         'Wind_in_speed (m/s)': speed,
     }
     row.update(outputs_dict)
-    row.update({
-        'SEC (kWh/L)': sec,
-        'COP': cop,
-        'Airborne water (kg/h)': airborne,
-        'Capture efficiency (%)': eff
-    })
+    row.update({'SEC (kWh/L)': sec, 'COP': cop, 'Airborne water (kg/h)': airborne, 'Capture efficiency (%)': eff})
     return row
 
-def _predict_direct(models: Dict[str, BaseEstimator],
-                    scaler: Optional[StandardScaler],
-                    features: np.ndarray,
-                    feature_names: List[str]) -> Dict[str, float]:
+def _predict_direct(models: Dict[str, BaseEstimator], scaler: Optional[StandardScaler],
+                    features: np.ndarray, feature_names: List[str]) -> Dict[str, float]:
     X = features.reshape(1, -1)
     if scaler is not None:
-        try:
-            check_is_fitted(scaler)
-            X = scaler.transform(X)
-        except Exception:
-            pass
-
+        try: check_is_fitted(scaler); X = scaler.transform(X)
+        except Exception: pass
     preds = {}
     for out_name_std, raw_name in STD_TO_RAW_TARGET.items():
         est = models.get(raw_name)
-        if est is None:
-            continue
+        if est is None: continue
         y_val = None
         try:
             y_val = est.predict(X)[0]
@@ -286,21 +205,16 @@ def _predict_direct(models: Dict[str, BaseEstimator],
             try:
                 if hasattr(est, "get_booster") and xgb is not None:
                     booster = est.get_booster()
-                    try:
-                        y_pred = booster.inplace_predict(X)
-                    except Exception:
-                        y_pred = booster.predict(xgb.DMatrix(X))
+                    try: y_pred = booster.inplace_predict(X)
+                    except Exception: y_pred = booster.predict(xgb.DMatrix(X))
                     y_val = float(y_pred[0])
             except Exception:
                 raise
-        if y_val is not None:
-            preds[out_name_std] = float(y_val)
+        if y_val is not None: preds[out_name_std] = float(y_val)
     return preds
 
-def _knn_match(df: pd.DataFrame,
-               temp: float, rh: float, speed: float,
-               tol_temp: float, tol_rh: float, tol_speed: float,
-               k_max: int = 5):
+def _knn_match(df: pd.DataFrame, temp: float, rh: float, speed: float,
+               tol_temp: float, tol_rh: float, tol_speed: float, k_max: int = 5):
     filt = (
         (df['Wind_in_temperature (°C)'].between(temp - tol_temp, temp + tol_temp)) &
         (df['Wind_in_rh (%)'].between(rh - tol_rh, rh + tol_rh)) &
@@ -316,82 +230,49 @@ def _knn_match(df: pd.DataFrame,
         sel = df.iloc[ind[0].tolist()]
     else:
         sel = dff
-
     outs, stds = {}, {}
     for std_name in TARGETS:
-        raw_col = None
-        for k, v in RAW_TARGET_TO_STD.items():
-            if v == std_name:
-                raw_col = k
-                break
+        raw_col = next((k for k, v in RAW_TARGET_TO_STD.items() if v == std_name), None)
         col_to_use = raw_col if (raw_col and raw_col in df.columns) else std_name
-        if col_to_use not in sel.columns:
-            continue
+        if col_to_use not in sel.columns: continue
         vals = sel[col_to_use].astype(float).dropna()
-        if len(vals) == 0:
-            continue
+        if len(vals) == 0: continue
         outs[std_name] = float(vals.mean())
         stds[std_name] = float(vals.std(ddof=1)) if len(vals) > 1 else 0.0
     return outs, stds, len(sel)
 
 def _build_feature_vector(temp, rh, speed):
-    temp_rh_interaction = temp * rh
-    speed_squared = speed ** 2
-    temp_rh_ratio = temp / (rh + 1e-6)
-    log_rh = np.log1p(rh)
-    log_speed = np.log1p(speed)
-    turb_rolling = 0.0
-    feats = np.array(
-        [temp, log_rh, log_speed, temp_rh_interaction, speed_squared, temp_rh_ratio, turb_rolling],
-        dtype=float
-    )
-    names = ['temp', 'log_rh', 'log_speed', 'temp_x_rh', 'speed_sq', 'temp/rh', 'turb_roll']
+    feats = np.array([
+        temp, np.log1p(rh), np.log1p(speed),
+        temp * rh, speed ** 2, temp / (rh + 1e-6), 0.0
+    ], dtype=float)
+    names = ['temp','log_rh','log_speed','temp_x_rh','speed_sq','temp/rh','turb_roll']
     return feats, names
 
 def _normalize_stem_to_raw(stem: str) -> Optional[str]:
-    s = stem.replace('.', ' ').replace('__', '_').replace('_final_model', '').strip()
-    candidates = [
-        ('Water production (L)', ['Water production (L)']),
-        ('real_time_power (kW)', ['real time power (kW)', 'real_time_power (kW)', 'real time power kW']),
-        ('DO', ['DO']),
-        ('ph', ['ph', 'pH', 'PH']),
-        ('Conductivity', ['Conductivity']),
-        ('water_turb', ['water turb', 'water_turb', 'turbidity']),
-    ]
-    s_low = s.lower()
-    for raw_key, aliases in candidates:
-        for a in aliases:
-            if s_low == a.lower():
-                return raw_key
-    if 'water' in s_low and 'production' in s_low and '(l)' in s_low:
-        return 'Water production (L)'
-    if 'power' in s_low and 'kw' in s_low:
-        return 'real_time_power (kW)'
-    if s_low in {'do'}: return 'DO'
-    if s_low in {'ph', 'p h'}: return 'ph'
-    if 'conduct' in s_low: return 'Conductivity'
-    if 'turb' in s_low: return 'water_turb'
+    s = stem.replace('.', ' ').replace('__', '_').replace('_final_model', '').strip().lower()
+    if 'water' in s and 'production' in s and '(l)' in s: return 'Water production (L)'
+    if 'power' in s and 'kw' in s: return 'real_time_power (kW)'
+    if s in {'do'}: return 'DO'
+    if s in {'ph','p h'}: return 'ph'
+    if 'conduct' in s: return 'Conductivity'
+    if 'turb' in s: return 'water_turb'
     return None
 
 def _load_model_artifacts(uploaded_files: List):
-    models: Dict[str, BaseEstimator] = {}
-    scaler: Optional[StandardScaler] = None
-    if not uploaded_files:
-        return models, scaler
+    models, scaler = {}, None
+    if not uploaded_files: return models, scaler
     for f in uploaded_files:
-        if not f.name.endswith('.pkl'):
-            continue
+        if not f.name.endswith('.pkl'): continue
         obj = joblib.load(f)
         if isinstance(obj, StandardScaler) or (hasattr(obj, "mean_") and hasattr(obj, "scale_")):
-            scaler = obj
-            continue
+            scaler = obj; continue
         stem = Path(f.name).stem
         raw_key = _normalize_stem_to_raw(stem) or stem
         models[raw_key] = obj
     return models, scaler
 
-# ---------------------- Plot helpers ----------------------
-
+# =============================== Plot helpers ================================
 _ORDER_FOR_PLOT = [
     'Water production (L/h)', 'Power (kW)', 'DO (mg/L)', 'ph',
     'Conductivity (µS/cm)', 'Turbidity (NTU)', 'SEC (kWh/L)', 'COP', 'Efficiency (%)'
@@ -400,99 +281,66 @@ _ORDER_FOR_PLOT = [
 def _build_plot_payload(row: dict) -> Dict[str, float]:
     return {k: row.get(k) for k in _ORDER_FOR_PLOT if k in row}
 
-def _bar_chart_with_optional_error(values_ml: Dict[str, float],
-                                   values_knn: Optional[Dict[str, float]] = None):
+def _bar_chart_with_optional_error(values_ml: Dict[str, float], values_knn: Optional[Dict[str, float]] = None):
     labels, nums, xerr, ann = [], [], None, []
     for k in _ORDER_FOR_PLOT:
         if k in values_ml and values_ml[k] is not None:
-            try:
-                v = float(values_ml[k])
-            except Exception:
-                continue
+            try: v = float(values_ml[k])
+            except Exception: continue
             labels.append(k); nums.append(v)
             if values_knn and k in values_knn and values_knn[k] is not None:
                 try:
-                    kn = float(values_knn[k])
-                    pct = 0.0 if v == 0 else abs(v - kn) / abs(v) * 100.0
-                    err_abs = abs(v) * (pct / 100.0)
+                    kn = float(values_knn[k]); pct = 0.0 if v == 0 else abs(v - kn)/abs(v)*100.0; err_abs = abs(v)*(pct/100.0)
                 except Exception:
                     pct, err_abs = 0.0, 0.0
             else:
                 pct, err_abs = 0.0, 0.0
-            ann.append(pct)
-            if xerr is None: xerr = []
-            xerr.append(err_abs)
-
-    if not nums:
-        return None
-
+            ann.append(pct); xerr = [] if xerr is None else xerr; xerr.append(err_abs)
+    if not nums: return None
     fig, ax = plt.subplots(figsize=(7.6, 4.8))
     y = np.arange(len(labels))[::-1]
-    if xerr is not None:
-        ax.barh(y, nums, xerr=xerr, capsize=4, edgecolor="black")
-    else:
-        ax.barh(y, nums, edgecolor="black")
-    ax.set_yticks(y, labels)
-    ax.grid(axis="x", linestyle="--", alpha=0.25)
-
+    ax.barh(y, nums, xerr=xerr, capsize=4, edgecolor="black") if xerr else ax.barh(y, nums, edgecolor="black")
+    ax.set_yticks(y, labels); ax.grid(axis="x", linestyle="--", alpha=0.25)
     for yi, v, p in zip(y, nums, ann):
         tail = f"  {v:.2f}" + (f"  ±{p:.1f}%" if p > 0 else "")
         ax.text(v, yi, tail, va="center", ha="left", fontsize=9)
+    plt.tight_layout(); return fig
 
-    plt.tight_layout()
-    return fig
-
-# ---------------------- Table helpers ----------------------
-
+# =============================== Table helpers ===============================
 def _safe_reindex(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    keep = [c for c in cols if c in df.columns]
-    return df.reindex(columns=keep)
+    return df.reindex(columns=[c for c in cols if c in df.columns])
 
 def _sanitize_cell(x):
-    # None stays None
-    if x is None:
-        return None
-    # Pandas / numpy NaN or inf -> None
+    if x is None: return None
     try:
-        if pd.isna(x):
-            return None
+        if pd.isna(x): return None
     except Exception:
         pass
-    if isinstance(x, float) and (math.isinf(x) or math.isnan(x)):
-        return None
-    # numpy scalar -> python scalar
-    if isinstance(x, np.generic):
-        return x.item()
-    # numeric -> float
-    if isinstance(x, (int, float, np.integer, np.floating)):
-        return float(x)
-    # pandas timestamp -> ISO string
-    if isinstance(x, (pd.Timestamp, )):
-        return x.isoformat()
-    # lists/tuples/dicts -> compact string
-    if isinstance(x, (list, tuple, dict, set)):
-        return str(x)
-    # booleans -> bool
-    if isinstance(x, (bool, np.bool_)):
-        return bool(x)
-    # strings -> keep
-    if isinstance(x, str):
-        return x
-    # anything else -> string fallback
+    if isinstance(x, float) and (math.isinf(x) or math.isnan(x)): return None
+    if isinstance(x, np.generic): return x.item()
+    if isinstance(x, (int, float, np.integer, np.floating)): return float(x)
+    if isinstance(x, (pd.Timestamp, )): return x.isoformat()
+    if isinstance(x, (list, tuple, dict, set)): return str(x)
+    if isinstance(x, (bool, np.bool_)): return bool(x)
+    if isinstance(x, str): return x
     return str(x)
 
 def _sanitize_for_arrow(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
+    if df is None or df.empty: return df
     df2 = df.copy()
-    for col in df2.columns:
-        df2[col] = df2[col].map(_sanitize_cell)
-    # ensure clean index
-    df2 = df2.reset_index(drop=True)
-    return df2
+    for col in df2.columns: df2[col] = df2[col].map(_sanitize_cell)
+    return df2.reset_index(drop=True)
 
-# ---------------------- Sidebar ----------------------
+def _display_df(df: pd.DataFrame, *, use_container_width=True):
+    """Robust display: sanitize -> try dataframe; on failure, stringify columns."""
+    clean = _sanitize_for_arrow(df)
+    try:
+        st.dataframe(clean, use_container_width=use_container_width)
+    except Exception:
+        # final fallback: stringify everything to guarantee Arrow compatibility
+        st.dataframe(clean.astype(str), use_container_width=use_container_width)
 
+# ================================ Sidebar ====================================
 st.sidebar.header("Configuration")
 
 with st.sidebar.expander("Upload ML-direct model artifacts (.pkl)", expanded=False):
@@ -514,7 +362,6 @@ with st.sidebar.expander("Upload historical dataset for KNN (.csv/.xlsx)", expan
         except Exception as e:
             st.error(f"Failed to read dataset: {e}")
 
-# ---- Auto-fill default dataset if none uploaded ----
 if hist_df is None and DEFAULT_DATA_URL:
     try:
         hist_df = _download_table(DEFAULT_DATA_URL)
@@ -529,27 +376,24 @@ with st.sidebar.expander("KNN settings", expanded=False):
     tol_speed = st.number_input("Speed window (±m/s)", 0.05, 5.0, 0.5, 0.05)
     k_max = st.slider("Max neighbors (fallback)", 1, 15, 5, 1)
 
-# ---- Auto-fill models from Release if nothing uploaded ----
 models_dict, scaler_obj = _autofill_models_if_none(models_dict, scaler_obj)
 
 st.title("AWG Dual Calculator: KNN matcher + ML direct predictor")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Single-point", "Compare (KNN vs ML)", "Batch", "Explain/AD", "Downloads"])
 
-# --- Single-point
+# ============================= Single-point ==================================
 with tab1:
     st.subheader("Single-point prediction")
     c1, c2, c3, c4 = st.columns(4)
-    temp = c1.number_input("Wind_in_temperature (°C)", -10.0, 60.0, 35.0, 0.1)
-    rh = c2.number_input("Wind_in_rh (%)", 1.0, 100.0, 70.0, 0.1)
+    temp  = c1.number_input("Wind_in_temperature (°C)", -10.0, 60.0, 35.0, 0.1)
+    rh    = c2.number_input("Wind_in_rh (%)", 1.0, 100.0, 70.0, 0.1)
     speed = c3.number_input("Wind_in_speed (m/s)", 0.0, 30.0, 0.5, 0.1)
     do_calc = c4.button("Predict", use_container_width=True)
 
     if do_calc:
-        rows = []
+        rows, ml_row, knn_row = [], None, None
         feats, feat_names = _build_feature_vector(temp, rh, speed)
-        ml_row = None
-        knn_row = None
 
         if models_dict:
             ml_out = _predict_direct(models_dict, scaler_obj, feats, feat_names)
@@ -575,17 +419,15 @@ with tab1:
             extra = [c for c in df.columns if c.endswith('STD%')]
             df_show = _safe_reindex(df, order_cols + extra)
             df_show = df_show.applymap(lambda z: nice_float(z, 3) if isinstance(z, (float, np.floating)) else z)
-            df_show = _sanitize_for_arrow(df_show)
-            st.dataframe(df_show, use_container_width=True)
+            _display_df(df_show)
             st.session_state['last_single_df'] = df_show
 
-            vals_ml = _build_plot_payload(ml_row or rows[0])
+            vals_ml  = _build_plot_payload(ml_row or rows[0])
             vals_knn = _build_plot_payload(knn_row) if knn_row else None
             fig = _bar_chart_with_optional_error(vals_ml, vals_knn)
-            if fig is not None:
-                st.pyplot(fig, use_container_width=True)
+            if fig is not None: st.pyplot(fig, use_container_width=True)
 
-# --- Compare
+# =============================== Compare =====================================
 with tab2:
     st.subheader("Side-by-side comparison")
     c1, c2, c3, c4 = st.columns(4)
@@ -595,14 +437,12 @@ with tab2:
     do_cmp = c4.button("Compare", use_container_width=True, key="cmp_btn")
 
     if do_cmp:
-        rows = []
-        ml_row = None
+        rows, ml_row, knn_row = [], None, None
         if models_dict:
             feats, feat_names = _build_feature_vector(temp_c, rh_c, spd_c)
             ml_out = _predict_direct(models_dict, scaler_obj, feats, feat_names)
             ml_row = _pack_predictions_row(temp_c, rh_c, spd_c, ml_out) | {'Model': 'ML-direct'}
             rows.append(ml_row)
-        knn_row = None
         if hist_df is not None:
             outs, stds, nsel = _knn_match(hist_df, temp_c, rh_c, spd_c, tol_temp, tol_rh, tol_speed, k_max)
             knn_row = _pack_predictions_row(temp_c, rh_c, spd_c, outs) | {'Model': f'KNN (n={nsel})'}
@@ -612,31 +452,26 @@ with tab2:
             df = pd.DataFrame(rows)
             order_cols = ['Model'] + TARGETS + DERIVED_METRICS
             df_show = _safe_reindex(df, order_cols)
-            df_show = _sanitize_for_arrow(df_show)
-            st.dataframe(df_show, use_container_width=True)
+            _display_df(df_show)
 
             if len(rows) == 2:
-                deltas = {
-                    k: (rows[0].get(k, np.nan) if rows[0].get(k) is not None else np.nan)
-                       - (rows[1].get(k, np.nan) if rows[1].get(k) is not None else np.nan)
-                    for k in TARGETS + DERIVED_METRICS
-                }
+                deltas = {k: (rows[0].get(k, np.nan) if rows[0].get(k) is not None else np.nan)
+                             - (rows[1].get(k, np.nan) if rows[1].get(k) is not None else np.nan)
+                          for k in TARGETS + DERIVED_METRICS}
                 deltas_df = pd.DataFrame([deltas])
-                deltas_df = _sanitize_for_arrow(deltas_df)
                 st.caption("ML-direct minus KNN (positive means ML higher):")
-                st.dataframe(deltas_df, use_container_width=True)
+                _display_df(deltas_df)
 
             st.session_state['last_compare_df'] = df_show
 
-            vals_ml = _build_plot_payload(ml_row or rows[0])
+            vals_ml  = _build_plot_payload(ml_row or rows[0])
             vals_knn = _build_plot_payload(knn_row) if knn_row else None
             fig = _bar_chart_with_optional_error(vals_ml, vals_knn)
-            if fig is not None:
-                st.pyplot(fig, use_container_width=True)
+            if fig is not None: st.pyplot(fig, use_container_width=True)
         else:
             st.warning("Provide both a dataset and model artifacts to compare.")
 
-# --- Batch
+# ================================ Batch ======================================
 with tab3:
     st.subheader("Batch predictions")
     st.write("Upload a CSV/XLSX with columns: 'Wind_in_temperature (°C)', 'Wind_in_rh (%)', 'Wind_in_speed (m/s)'.")
@@ -660,15 +495,14 @@ with tab3:
                     out_rows.append(_pack_predictions_row(t, h, s, outs) | {'Model': f'KNN (n={nsel})'})
             if out_rows:
                 df_out = pd.DataFrame(out_rows)
-                df_out = _sanitize_for_arrow(df_out)
-                st.dataframe(df_out, use_container_width=True)
+                _display_df(df_out)
                 st.session_state['last_batch_df'] = df_out
             else:
                 st.warning("Nothing computed. Ensure required inputs and uploads are provided.")
         except Exception as e:
             st.error(f"Batch error: {e}")
 
-# --- Explainability / AD
+# ============================ Explainability / AD ============================
 with tab4:
     st.subheader("Explainability and Applicability Domain (AD)")
     st.write("Upload an optional training feature table to enable percentile-based AD flags and SHAP (for ML-direct).")
@@ -695,9 +529,8 @@ with tab4:
                 if name in train_feats.columns:
                     lo, hi = np.percentile(train_feats[name].dropna().to_numpy(), [1, 99])
                     bounds[name] = (lo, hi)
-            ad_df = pd.DataFrame(bounds, index=['p01', 'p99']).T
-            ad_df = _sanitize_for_arrow(ad_df)
-            st.dataframe(ad_df, use_container_width=True)
+            ad_df = pd.DataFrame(bounds, index=['p01','p99']).T
+            _display_df(ad_df)
             flags = {nm: (val := {'Wind_in_temperature (°C)': t_e, 'Wind_in_rh (%)': rh_e, 'Wind_in_speed (m/s)': sp_e}[nm]) < bounds[nm][0] or val > bounds[nm][1]
                      for nm in bounds}
             st.info(f"Out-of-domain flags (1%/99% bounds): {flags}")
@@ -714,11 +547,8 @@ with tab4:
                 feats, feat_names = _build_feature_vector(t_e, rh_e, sp_e)
                 X = feats.reshape(1, -1)
                 if scaler_obj is not None:
-                    try:
-                        check_is_fitted(scaler_obj)
-                        X = scaler_obj.transform(X)
-                    except Exception:
-                        pass
+                    try: check_is_fitted(scaler_obj); X = scaler_obj.transform(X)
+                    except Exception: pass
                 model_keys = list(models_dict.keys())
                 chosen_key = st.selectbox("Pick a regressor to explain", model_keys) if model_keys else None
                 if chosen_key:
@@ -727,15 +557,14 @@ with tab4:
                     sv = explainer(X)
                     vals = sv.values[0] if hasattr(sv, "values") else sv[0].values
                     shap_df = pd.DataFrame({'feature': feat_names, 'shap_value': vals})
-                    shap_df = _sanitize_for_arrow(shap_df)
-                    st.dataframe(shap_df, use_container_width=True)
+                    _display_df(shap_df)
                     st.session_state['last_shap_df'] = shap_df
                     st.caption("Bar chart of SHAP values")
                     st.bar_chart(pd.DataFrame(shap_df).set_index('feature'))
             except Exception as e:
                 st.error(f"SHAP error: {e}")
 
-# --- Downloads
+# =============================== Downloads ===================================
 with tab5:
     st.subheader("Session downloads")
     for key, label in [
@@ -746,8 +575,7 @@ with tab5:
     ]:
         df = st.session_state.get(key)
         if isinstance(df, pd.DataFrame):
-            buf = io.StringIO()
-            df.to_csv(buf, index=False)
+            buf = io.StringIO(); df.to_csv(buf, index=False)
             st.download_button(label=label, data=buf.getvalue(), file_name=f"{key}.csv", mime="text/csv")
 
 st.caption("Tip: Run locally with `pip install -r requirements.txt && streamlit run awg_app.py`. For cloud deploy, include the same requirements.")
