@@ -1,10 +1,10 @@
 # awg_app.py — AWG predictions (ML-direct + KNN) with robust table display + plots
-# - Airflow for KPIs is fixed internally at 90,000 m³/h
+# - Airflow for KPIs is fixed internally at 90,000 m³/h (no UI text)
 # - Default models & dataset auto-downloaded from GitHub Releases
 # - Column normalization for KNN inputs
-# - Horizontal bar charts with ±% error bars (ML vs KNN)
-# - SHAP bar plot via matplotlib (no Arrow)
+# - Horizontal bar charts with ±% error bars (ML vs KNN), no "Airborne water" in plot
 # - DataFrame display falls back to pure HTML if Arrow fails
+# - Explain/AD tab: only AD bounds/flags (SHAP removed)
 
 import io, math, os
 from io import BytesIO
@@ -15,12 +15,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-
-# Optional imports
-try:
-    import shap
-except Exception:
-    shap = None
 
 # XGBoost fallback (for sklearn wrapper quirks)
 try:
@@ -305,19 +299,18 @@ def _load_model_artifacts(uploaded_files: List):
     return models, scaler
 
 # =============================== Plot helpers ================================
+# Order used in plot (NO 'Airborne water (kg/h)' here):
 _ORDER_FOR_PLOT = [
-    # measured/predicted first
     'Water production (L/h)', 'Power (kW)', 'DO (mg/L)', 'ph',
-    'Conductivity (µS/cm)', 'Turbidity (NTU)',
-    # derived after
-    'SEC (kWh/L)', 'COP', 'Airborne water (kg/h)', 'Capture efficiency (%)'
+    'Conductivity (µS/cm)', 'Turbidity (NTU)', 'SEC (kWh/L)', 'COP',
+    'Capture efficiency (%)'
 ]
 
 def _build_plot_payload(row: dict) -> Dict[str, float]:
     return {k: row.get(k) for k in _ORDER_FOR_PLOT if k in row}
 
 def _bar_chart_with_optional_error(values_ml: Dict[str, float], values_knn: Optional[Dict[str, float]] = None):
-    labels, nums, xerr, ann = [], [], None, []
+    labels, nums, xerr_abs, pct_ann = [], [], [], []
     for k in _ORDER_FOR_PLOT:
         if k in values_ml and values_ml[k] is not None:
             try: v = float(values_ml[k])
@@ -326,22 +319,40 @@ def _bar_chart_with_optional_error(values_ml: Dict[str, float], values_knn: Opti
             if values_knn and k in values_knn and values_knn[k] is not None:
                 try:
                     kn = float(values_knn[k])
-                    pct = 0.0 if v == 0 else abs(v - kn)/abs(v)*100.0
+                    pct = 0.0 if v == 0 else abs(v - kn)/max(1e-9, abs(v))*100.0
                     err_abs = abs(v)*(pct/100.0)
                 except Exception:
                     pct, err_abs = 0.0, 0.0
             else:
                 pct, err_abs = 0.0, 0.0
-            ann.append(pct); xerr = [] if xerr is None else xerr; xerr.append(err_abs)
+            pct_ann.append(pct); xerr_abs.append(err_abs)
+
     if not nums: return None
+
+    max_bar = max(nums)
+    max_err = max(xerr_abs) if xerr_abs else 0.0
+    pad = max(0.03 * (max_bar + max_err), 0.5)  # right-side padding for labels
+
     fig, ax = plt.subplots(figsize=(7.6, 4.8))
     y = np.arange(len(labels))[::-1]
-    ax.barh(y, nums, xerr=xerr, capsize=4, edgecolor="black") if xerr else ax.barh(y, nums, edgecolor="black")
-    ax.set_yticks(y, labels); ax.grid(axis="x", linestyle="--", alpha=0.25)
-    for yi, v, p in zip(y, nums, ann):
-        tail = f"  {v:.2f}" + (f"  ±{p:.1f}%" if p > 0 else "")
-        ax.text(v, yi, tail, va="center", ha="left", fontsize=9)
-    plt.tight_layout(); return fig
+
+    if any(e > 0 for e in xerr_abs):
+        ax.barh(y, nums, xerr=xerr_abs, capsize=4, edgecolor="black")
+    else:
+        ax.barh(y, nums, edgecolor="black")
+
+    ax.set_yticks(y, labels)
+    ax.grid(axis="x", linestyle="--", alpha=0.25)
+
+    # Text placed to the RIGHT of bar + error bar
+    for yi, v, p, e in zip(y, nums, pct_ann, xerr_abs):
+        x_text = v + e + pad
+        txt = f"{v:.2f}" + (f"  ±{p:.1f}%" if p > 0 else "")
+        ax.text(x_text, yi, txt, va="center", ha="left", fontsize=9)
+
+    ax.set_xlim(left=0, right=max(nums) + max(xerr_abs) + 3*pad)
+    plt.tight_layout()
+    return fig
 
 # =============================== Table helpers ===============================
 def _safe_reindex(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
@@ -376,14 +387,11 @@ def _display_df(df: pd.DataFrame, *, use_container_width=True):
       3) If HTML rendering somehow fails, print CSV text.
     """
     clean = _sanitize_for_arrow(df)
-    # First try normal interactive dataframe
     try:
         st.dataframe(clean, use_container_width=use_container_width)
         return
     except Exception:
-        pass  # fall through to HTML
-
-    # FINAL FALLBACK: pure HTML (no Arrow involved)
+        pass
     try:
         printable = clean.copy()
         for c in printable.columns:
@@ -402,7 +410,6 @@ def _display_df(df: pd.DataFrame, *, use_container_width=True):
         )
         st.markdown(f"<div class='dfwrap'>{html}</div>", unsafe_allow_html=True)
     except Exception as e:
-        # Absolute last resort: show CSV text
         try:
             buf = io.StringIO(); clean.to_csv(buf, index=False)
             st.text(buf.getvalue())
@@ -450,7 +457,6 @@ with st.sidebar.expander("KNN settings", expanded=False):
 models_dict, scaler_obj = _autofill_models_if_none(models_dict, scaler_obj)
 
 st.title("AWG Dual Calculator: KNN matcher + ML direct predictor")
-st.caption("Note: KPIs assume fixed airflow of 90,000 m³/h. Wind speed still affects KNN filtering and ML features.")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Single-point", "Compare (KNN vs ML)", "Batch", "Explain/AD", "Downloads"])
 
@@ -576,9 +582,9 @@ with tab3:
 
 # ============================ Explainability / AD ============================
 with tab4:
-    st.subheader("Explainability and Applicability Domain (AD)")
-    st.write("Upload an optional training feature table to enable percentile-based AD flags and SHAP (for ML-direct).")
-    feat_file = st.file_uploader("Training features CSV/XLSX (optional)", type=["csv", "xlsx", "xls"], key="featupload")
+    st.subheader("Applicability Domain (AD)")
+    st.write("Upload a training feature table to compute 1%/99% percentile bounds and out-of-domain flags.")
+    feat_file = st.file_uploader("Training features CSV/XLSX", type=["csv", "xlsx", "xls"], key="featupload")
     train_feats = None
     if feat_file is not None:
         try:
@@ -589,12 +595,11 @@ with tab4:
             st.error(f"Could not read features: {e}")
 
     c1, c2, c3 = st.columns(3)
-    t_e = c1.number_input("Temperature (°C) for explain", -10.0, 60.0, 35.0, 0.1, key="exp_t")
-    rh_e = c2.number_input("RH (%) for explain", 1.0, 100.0, 70.0, 0.1, key="exp_rh")
-    sp_e = c3.number_input("Speed (m/s) for explain", 0.0, 30.0, 0.5, 0.1, key="exp_sp")
+    t_e = c1.number_input("Temperature (°C) to test", -10.0, 60.0, 35.0, 0.1, key="exp_t")
+    rh_e = c2.number_input("RH (%) to test", 1.0, 100.0, 70.0, 0.1, key="exp_rh")
+    sp_e = c3.number_input("Speed (m/s) to test", 0.0, 30.0, 0.5, 0.1, key="exp_sp")
 
-    colA, colB = st.columns(2)
-    if colA.button("Compute AD flags", use_container_width=True):
+    if st.button("Compute AD flags", use_container_width=True):
         if train_feats is not None:
             bounds = {}
             for name in EXPECTED_INPUTS:
@@ -603,48 +608,13 @@ with tab4:
                     bounds[name] = (lo, hi)
             ad_df = pd.DataFrame(bounds, index=['p01','p99']).T
             _display_df(ad_df)
-            flags = {
-                nm: (val := {'Wind_in_temperature (°C)': t_e, 'Wind_in_rh (%)': rh_e, 'Wind_in_speed (m/s)': sp_e}[nm]) < bounds[nm][0]
-                    or val > bounds[nm][1]
-                for nm in bounds
-            }
+            flags = {}
+            for nm, (lo, hi) in bounds.items():
+                xmap = {'Wind_in_temperature (°C)': t_e, 'Wind_in_rh (%)': rh_e, 'Wind_in_speed (m/s)': sp_e}
+                flags[nm] = (xmap[nm] < lo) or (xmap[nm] > hi)
             st.info(f"Out-of-domain flags (1%/99% bounds): {flags}")
         else:
             st.warning("Upload training features to enable AD bounds.")
-
-    if colB.button("Compute SHAP for ML-direct", use_container_width=True):
-        if shap is None:
-            st.error("SHAP not installed. Please ensure 'shap' is in requirements.")
-        elif not models_dict:
-            st.warning("Upload ML models first or ensure auto-download succeeded.")
-        else:
-            try:
-                feats, feat_names = _build_feature_vector(t_e, rh_e, sp_e)
-                X = feats.reshape(1, -1)
-                if scaler_obj is not None:
-                    try: check_is_fitted(scaler_obj); X = scaler_obj.transform(X)
-                    except Exception: pass
-                model_keys = list(models_dict.keys())
-                chosen_key = st.selectbox("Pick a regressor to explain", model_keys) if model_keys else None
-                if chosen_key:
-                    model = models_dict[chosen_key]
-                    explainer = shap.Explainer(model)
-                    sv = explainer(X)
-                    vals = sv.values[0] if hasattr(sv, "values") else sv[0].values
-                    shap_df = pd.DataFrame({'feature': feat_names, 'shap_value': vals})
-                    _display_df(shap_df)
-
-                    # Matplotlib SHAP bar (avoid Arrow)
-                    fig, ax = plt.subplots(figsize=(6.4, 3.6))
-                    ax.barh(range(len(feat_names)), shap_df['shap_value'].astype(float))
-                    ax.set_yticks(range(len(feat_names))); ax.set_yticklabels(shap_df['feature'])
-                    ax.grid(axis="x", linestyle="--", alpha=0.25)
-                    plt.tight_layout()
-                    st.pyplot(fig, use_container_width=True)
-
-                    st.session_state['last_shap_df'] = shap_df
-            except Exception as e:
-                st.error(f"SHAP error: {e}")
 
 # =============================== Downloads ===================================
 with tab5:
@@ -653,7 +623,6 @@ with tab5:
         ('last_single_df',  "Single-point results CSV"),
         ('last_compare_df', "Compare results CSV"),
         ('last_batch_df',   "Batch results CSV"),
-        ('last_shap_df',    "SHAP values CSV")
     ]:
         df = st.session_state.get(key)
         if isinstance(df, pd.DataFrame):
