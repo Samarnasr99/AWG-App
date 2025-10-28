@@ -5,7 +5,7 @@ import math
 import os
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,12 @@ try:
     import shap
 except Exception:
     shap = None
+
+# XGBoost (for Booster fallback)
+try:
+    import xgboost as xgb
+except Exception:
+    xgb = None
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import KDTree
@@ -179,6 +185,7 @@ def _predict_direct(models: Dict[str, BaseEstimator],
                     scaler: Optional[StandardScaler],
                     features: np.ndarray,
                     feature_names: List[str]) -> Dict[str, float]:
+    """Predict with uploaded/auto models; tolerant to XGBoost sklearn wrapper issues."""
     X = features.reshape(1, -1)
     if scaler is not None:
         try:
@@ -186,13 +193,33 @@ def _predict_direct(models: Dict[str, BaseEstimator],
             X = scaler.transform(X)
         except Exception:
             pass
+
     preds = {}
     for out_name_std, raw_name in STD_TO_RAW_TARGET.items():
         est = models.get(raw_name)
         if est is None:
             continue
-        y = est.predict(X)[0]
-        preds[out_name_std] = float(y)
+
+        y_val = None
+        # Normal path
+        try:
+            y_val = est.predict(X)[0]
+        except Exception:
+            # Fallback for XGBoost sklearn wrapper → use Booster directly
+            try:
+                if hasattr(est, "get_booster") and xgb is not None:
+                    booster = est.get_booster()
+                    try:
+                        y_pred = booster.inplace_predict(X)
+                    except Exception:
+                        y_pred = booster.predict(xgb.DMatrix(X))
+                    y_val = float(y_pred[0])
+            except Exception:
+                # If still failing, re-raise so the user sees a clear error
+                raise
+
+        if y_val is not None:
+            preds[out_name_std] = float(y_val)
     return preds
 
 def _knn_match(df: pd.DataFrame,
@@ -212,7 +239,7 @@ def _knn_match(df: pd.DataFrame,
         scaler = StandardScaler().fit(base)
         tree = KDTree(scaler.transform(base))
         d = scaler.transform([[temp, rh, speed]])
-        dist, ind = tree.query(d, k=min(k_max, base.shape[0]))
+        _, ind = tree.query(d, k=min(k_max, base.shape[0]))
         idxs = ind[0].tolist()
         sel = df.iloc[idxs]
     else:
@@ -254,7 +281,7 @@ def _normalize_stem_to_raw(stem: str) -> Optional[str]:
     into RAW keys (e.g., 'Water production (L)'). Returns None if no match.
     """
     s = stem.replace('.', ' ')
-    s = s.replace('__', '_')  # just in case
+    s = s.replace('__', '_')
     s = s.replace('_final_model', '').strip()
     candidates = [
         ('Water production (L)', ['Water production (L)']),
@@ -269,7 +296,6 @@ def _normalize_stem_to_raw(stem: str) -> Optional[str]:
         for a in aliases:
             if s_low == a.lower():
                 return raw_key
-    # extra heuristics
     if 'water' in s_low and 'production' in s_low and '(l)' in s_low:
         return 'Water production (L)'
     if 'power' in s_low and 'kw' in s_low:
@@ -285,9 +311,7 @@ def _normalize_stem_to_raw(stem: str) -> Optional[str]:
     return None
 
 def _load_model_artifacts(uploaded_files: List):
-    """
-    Accept uploaded .pkl files (scaler + regressors). Map *_final_model to RAW keys.
-    """
+    """Accept uploaded .pkl files (scaler + regressors). Map *_final_model to RAW keys."""
     models: Dict[str, BaseEstimator] = {}
     scaler: Optional[StandardScaler] = None
     if not uploaded_files:
@@ -481,7 +505,6 @@ with tab4:
 
     colA, colB = st.columns(2)
     if colA.button("Compute AD flags", use_container_width=True):
-        ad_msgs = []
         if train_feats is not None:
             # Simple percentile AD on raw inputs
             bounds = {}
@@ -492,9 +515,10 @@ with tab4:
             ad_df = pd.DataFrame(bounds, index=['p01', 'p99']).T
             st.dataframe(ad_df, use_container_width=True)
             flags = {}
+            inputs_map = {'Wind_in_temperature (°C)': t_e, 'Wind_in_rh (%)': rh_e, 'Wind_in_speed (m/s)': sp_e}
             for nm, (lo, hi) in bounds.items():
-                x = {'Wind_in_temperature (°C)': t_e, 'Wind_in_rh (%)': rh_e, 'Wind_in_speed (m/s)': sp_e}[nm]
-                flags[nm] = (x < lo) or (x > hi)
+                xval = inputs_map[nm]
+                flags[nm] = (xval < lo) or (xval > hi)
             st.info(f"Out-of-domain flags (1%/99% bounds): {flags}")
         else:
             st.warning("Upload training features to enable AD bounds.")
