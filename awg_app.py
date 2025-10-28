@@ -5,6 +5,7 @@
 # - Default models & dataset auto-downloaded from GitHub Releases
 # - Robust header aliasing for KNN inputs
 # - Horizontal bar charts with optional ±% error bars (ML vs KNN)
+# - Safe dataframe column selection to avoid KeyErrors
 
 import io
 import math
@@ -394,7 +395,6 @@ def _load_model_artifacts(uploaded_files: List):
     return models, scaler
 
 # ---------------------- Plot helpers ----------------------
-
 _ORDER_FOR_PLOT = [
     'Water production (L/h)', 'Power (kW)', 'DO (mg/L)', 'ph',
     'Conductivity (µS/cm)', 'Turbidity (NTU)', 'SEC (kWh/L)', 'COP', 'Efficiency (%)'
